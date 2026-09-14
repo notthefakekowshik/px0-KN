@@ -1134,11 +1134,22 @@ async function gotoDefinition(arg) {
     setStatusNote('definition of ' + at.word + '…');
     const j = await lspCall('def', at, S.lsp.state === 'ready' ? 5000 : 20000);
     updateStatus();
-    if (j && j.hits && j.hits.length) { acceptHits(at.word, j.hits, j.server, 'definition'); return; }
+    if (j && j.hits && j.hits.length) {
+      const repoHits = j.hits.filter(h => !h.ext);
+      if (repoHits.length > 0) {
+        acceptHits(at.word, repoHits, j.server, 'definition');
+        return;
+      }
+      setStatusNote('External / standard library symbol: "' + at.word + '"' + (j.server ? ' (' + j.server + ')' : ''));
+      return;
+    }
   } else if (!at.imprecise && S.lsp.state === 'starting') {
     // Kick the server awake for next time, but do not wait on it.
     lspCall('def', at, 60000).then(j => {
-      if (j && j.hits && j.hits.length) showHits(at.word, j.hits, j.server, 'definition');
+      if (j && j.hits && j.hits.length) {
+        const repoHits = j.hits.filter(h => !h.ext);
+        if (repoHits.length > 0) showHits(at.word, repoHits, j.server, 'definition');
+      }
     });
   }
 
@@ -1150,9 +1161,7 @@ async function gotoDefinition(arg) {
   if (rx.lsp) setLspState(rx.lsp);
 
   if (!rx.defs || !rx.defs.length) {
-    showPanel('search');
-    const q = $('#q');
-    if (q) { q.value = at.word; $('#o-word')?.classList.add('on'); runSearch(); }
+    setStatusNote('No definition found for "' + at.word + '" in repository');
     return;
   }
   acceptHits(at.word, rx.defs, null, 'definition', rx.refCount);
@@ -1166,14 +1175,19 @@ async function findReferences(arg) {
 }
 
 function acceptHits(word, hits, server, noun, refCount) {
-  if (hits.length === 1) {
-    const h = hits[0];
+  const repoHits = hits.filter(h => !h.ext);
+  if (!repoHits.length) {
+    setStatusNote('External / standard library symbol: "' + word + '"' + (server ? ' (' + server + ')' : ''));
+    return;
+  }
+  if (repoHits.length === 1) {
+    const h = repoHits[0];
     openFile(h.path, { line: h.line });
     flashFind(h.mid || word);
     setStatusNote(server ? server + ' · ' + h.path + ':' + h.line : h.path + ':' + h.line);
     return;
   }
-  showHits(word, hits, server, noun, refCount);
+  showHits(word, repoHits, server, noun, refCount);
 }
 
 function showHits(word, hits, server, noun, refCount) {

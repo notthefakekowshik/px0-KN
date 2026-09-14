@@ -3257,7 +3257,7 @@ const SHORTCUTS = [
   [['F12', 'Mod+Click'], 'Go to definition'], [['Shift+F12'], 'Find all references'],
   [['Alt+Shift+H'], 'Call trail (callers / callees)'],
   [['Mod+J'], 'Toggle right inspector (Symbols/Refs)'],
-  [['Alt+Left', 'Alt+Right'], 'Navigate back / forward'], [['Mod+B'], 'Toggle sidebar'],
+  [['Ctrl+-|Alt+Left', 'Ctrl+Shift+-|Alt+Right'], 'Navigate back / forward'], [['Mod+B'], 'Toggle sidebar'],
   [['Alt+W'], 'Close tab'], [['Alt+Shift+T'], 'Reopen closed tab'], [['Ctrl+Tab'], 'Next tab'],
   [['Alt+1…9'], 'Select tab'], [['Double click'], 'Highlight all occurrences'],
   [['Mod+A'], 'Select whole file'],
@@ -3353,8 +3353,19 @@ function initShortcuts() {
       if (e.shiftKey) findReferences(); else gotoDefinition();
       return;
     }
+    // Navigate back / forward in history:
+    // 1. VS Code / Cursor macOS style: Ctrl+- (back), Ctrl+Shift+- (forward)
+    if (e.ctrlKey && !e.metaKey && !e.altKey && (e.code === 'Minus' || e.key === '-' || e.key === '_')) {
+      e.preventDefault();
+      go(e.shiftKey ? 1 : -1);
+      return;
+    }
+    // 2. Alt+Left / Alt+Right (VS Code PC style & standard px0)
     if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); go(-1); return; }
     if (e.altKey && e.key === 'ArrowRight') { e.preventDefault(); go(1); return; }
+    // 3. Cmd+[ / Cmd+] (macOS browser / Xcode style)
+    if (mod && !e.shiftKey && !e.altKey && !inField(document.activeElement) && (e.code === 'BracketLeft' || e.key === '[')) { e.preventDefault(); go(-1); return; }
+    if (mod && !e.shiftKey && !e.altKey && !inField(document.activeElement) && (e.code === 'BracketRight' || e.key === ']')) { e.preventDefault(); go(1); return; }
     if (e.ctrlKey && e.key === 'Tab') {
       e.preventDefault();
       if (S.tabs.length > 1) switchTab((S.active + (e.shiftKey ? -1 : 1) + S.tabs.length) % S.tabs.length);

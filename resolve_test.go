@@ -137,3 +137,19 @@ func TestResolveTarget(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkResolveTarget(b *testing.B) {
+	ix := &Index{
+		files: []FileEntry{
+			{Path: "README.md", Name: "README.md"},
+			{Path: "docs/architecture.md", Name: "architecture.md"},
+			{Path: "web/src/cursor.js", Name: "cursor.js"},
+			{Path: "web/src/state.js", Name: "state.js"},
+			{Path: "web/src/utils/index.js", Name: "index.js"},
+		},
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = resolveTarget(ix, "web/src/cursor.js", "./state")
+	}
+}

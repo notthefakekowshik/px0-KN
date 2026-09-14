@@ -27,6 +27,9 @@ var probeIndexes = []string{
 // an indexed workspace path.
 func resolveTarget(ix *Index, fromRel, target string) ResolveResult {
 	target = strings.TrimSpace(target)
+	if idx := strings.Index(target, "]("); idx >= 0 {
+		target = strings.TrimSuffix(target[idx+2:], ")")
+	}
 	target = strings.Trim(target, `"'`+"`"+`<>()[]`)
 	target = strings.TrimSpace(target)
 	if target == "" || strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") || strings.HasPrefix(target, "mailto:") {

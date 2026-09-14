@@ -56,26 +56,36 @@ export function fileKind(name) {
 
 /* Expand the tree down to dir and scroll it into view. */
 export async function revealDir(dir) {
+  if (!dir) return;
   const parts = dir.split('/');
   for (let i = 0; i < parts.length; i++) {
     const p = parts.slice(0, i + 1).join('/');
     const row = treeEl.querySelector('[data-dir="' + CSS.escape(p) + '"]');
     if (!row) break;
-    if (!row.classList.contains('open')) row.click();
-    await new Promise(r => setTimeout(r, 30));
+    const kids = treeEl.querySelector('[data-kids="' + CSS.escape(p) + '"]');
+    if (!row.classList.contains('open')) {
+      row.classList.add('open');
+      if (kids) kids.classList.add('open');
+      openDirs.add(p);
+      if (kids && !kids.dataset.loaded) {
+        kids.dataset.loaded = '1';
+        await drawTree(p, kids, p.split('/').length);
+      }
+    }
   }
   const last = treeEl.querySelector('[data-dir="' + CSS.escape(dir) + '"]');
-  if (last) last.scrollIntoView({ block: 'center' });
+  if (last) last.scrollIntoView({ block: 'nearest' });
 }
 
 export async function revealFile(path) {
+  if (!path) return;
   const dir = path.slice(0, path.lastIndexOf('/'));
   if (dir) await revealDir(dir);
   const row = treeEl.querySelector('[data-file="' + CSS.escape(path) + '"]');
   if (row) {
     $$('.tr.sel', treeEl).forEach(x => x.classList.remove('sel'));
     row.classList.add('sel');
-    row.scrollIntoView({ block: 'center' });
+    row.scrollIntoView({ block: 'nearest' });
   }
 }
 

@@ -3,7 +3,7 @@ import { $, esc, S, doc_, api, isMac, MOD, withKeys } from './state.js';
 import { vp, editor, copyToClipboard } from './ui.js';
 import { paint } from './renderer.js';
 import { setLspState } from './status.js';
-import { wordAtPoint } from './cursor.js';
+import { wordAtPoint, pathAtPoint } from './cursor.js';
 import { findReferences } from './lsp.js';
 import { showCalls } from './calls.js';
 
@@ -21,7 +21,7 @@ const sameWord = (a, b) => !!a && !!b && a.line === b.line && a.col === b.col &&
    the card is about to open. Everything on the hot path below is arithmetic. */
 export function onMove({ x, y, mod }) {
   if (mod) {
-    const at = doc_() ? wordAtPoint(x, y) : null;
+    const at = doc_() ? (pathAtPoint(x, y) || wordAtPoint(x, y)) : null;
     if (!sameWord(at, S.link)) {
       S.link = at;
       vp.classList.toggle('linking', !!at);

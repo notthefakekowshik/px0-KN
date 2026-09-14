@@ -7,11 +7,28 @@ import { treeEl, openDirs, drawTree } from './tree.js';
 
 export function showPanel(name) {
   document.body.classList.remove('side-hidden');
+  const filesPanel = $('#panel-files');
+  const searchPanel = $('#panel-search');
+  if (name === 'search') {
+    filesPanel?.classList.remove('active');
+    searchPanel?.classList.add('active');
+    const q = $('#q');
+    if (q) {
+      q.focus();
+      q.select();
+    }
+  } else {
+    searchPanel?.classList.remove('active');
+    filesPanel?.classList.add('active');
+  }
   layout();
   render();
 }
 
 export function initPanels() {
+  $('#btn-show-search')?.addEventListener('click', () => showPanel('search'));
+  $('#btn-show-files')?.addEventListener('click', () => showPanel('files'));
+
   $('#btn-reindex').addEventListener('click', async () => {
     $('#st-index').textContent = 'reindexing…';
     const j = await api('/api/reindex');

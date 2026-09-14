@@ -9,10 +9,11 @@ export let lastResults = null;
 // The search panel is optional markup; without it every entry point is a no-op.
 export const runSearch = debounce(async () => {
   const qEl = $('#q');
-  if (!qEl || !resultsEl) return;
+  const resEl = $('#results');
+  if (!qEl || !resEl) return;
   const q = qEl.value;
-  if (!q.trim()) { resultsEl.innerHTML = ''; return; }
-  resultsEl.innerHTML = '<div class="hint">searching…</div>';
+  if (!q.trim()) { resEl.innerHTML = ''; return; }
+  resEl.innerHTML = '<div class="hint">searching…</div>';
   const params = {
     q, glob: $('#glob')?.value || '',
     case: $('#o-case')?.classList.contains('on') ? 1 : '',
@@ -23,15 +24,16 @@ export const runSearch = debounce(async () => {
     const j = await api('/api/search', params);
     renderResults(j);
   } catch (e) {
-    resultsEl.innerHTML = '<div class="hint">' + esc(e.message) + '</div>';
+    resEl.innerHTML = '<div class="hint">' + esc(e.message) + '</div>';
   }
 }, 160);
 
 export function renderResults(j) {
   lastResults = j;
-  if (!resultsEl) return;
+  const resEl = $('#results');
+  if (!resEl) return;
   if (!j.results || !j.results.length) {
-    resultsEl.innerHTML = '<div class="hint">No results.</div>';
+    resEl.innerHTML = '<div class="hint">No results.</div>';
     return;
   }
   const head = j.header || (j.total.toLocaleString() + ' result' + (j.total === 1 ? '' : 's') +
@@ -51,7 +53,7 @@ export function renderResults(j) {
     }
     html += '</div>';
   }
-  resultsEl.innerHTML = html;
+  resEl.innerHTML = html;
 }
 
 /* External results carry an absolute path, which is far too long for the
@@ -63,30 +65,34 @@ export function displayPath(p) {
 }
 
 export function initSearch() {
-  if (!resultsEl) return;
-  resultsEl.addEventListener('click', e => {
+  const resEl = $('#results');
+  const qEl = $('#q');
+  if (!resEl || !qEl) return;
+  resEl.addEventListener('click', e => {
     const t = e.target.closest('[data-toggle]');
     if (t) {
-      const g = resultsEl.querySelector('[data-group="' + CSS.escape(t.dataset.toggle) + '"]');
-      const hidden = g.style.display === 'none';
-      g.style.display = hidden ? '' : 'none';
-      $('.ar', t).innerHTML = hidden ? '&#9660;' : '&#9654;';
+      const g = resEl.querySelector('[data-group="' + CSS.escape(t.dataset.toggle) + '"]');
+      if (g) {
+        const hidden = g.style.display === 'none';
+        g.style.display = hidden ? '' : 'none';
+        $('.ar', t).innerHTML = hidden ? '&#9660;' : '&#9654;';
+      }
       return;
     }
     const r = e.target.closest('.rline');
     if (r) {
-      $$('.rline.sel', resultsEl).forEach(x => x.classList.remove('sel'));
+      $$('.rline.sel', resEl).forEach(x => x.classList.remove('sel'));
       r.classList.add('sel');
       openFile(r.dataset.p, { line: +r.dataset.n });
-      const q = $('#q').value;
+      const q = qEl.value;
       if (q) flashFind(q);
     }
   });
 
-  $('#q').addEventListener('input', runSearch);
-  $('#glob').addEventListener('input', runSearch);
-  $$('.opt').forEach(b => b.addEventListener('click', () => { b.classList.toggle('on'); runSearch(); }));
-  $('#q').addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); const f = $('.rline', resultsEl); if (f) f.click(); }
+  qEl.addEventListener('input', runSearch);
+  $('#glob')?.addEventListener('input', runSearch);
+  $$('.opt', $('#panel-search')).forEach(b => b.addEventListener('click', () => { b.classList.toggle('on'); runSearch(); }));
+  qEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); const f = $('.rline', resEl); if (f) f.click(); }
   });
 }

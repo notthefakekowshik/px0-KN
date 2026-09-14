@@ -7,7 +7,7 @@ import { pushHistory } from './history.js';
 import { warmLSP } from './lsp.js';
 import { loadOutline } from './outline.js';
 import { showPanel } from './panels.js';
-import { revealDir } from './tree.js';
+import { revealDir, revealFile } from './tree.js';
 import { clearLink } from './hover.js';
 import { clearFind } from './find.js';
 import { clearSelectAll } from './selbar.js';
@@ -71,6 +71,7 @@ export async function openFile(path, opts = {}) {
   updateStatus();
   if ($('#panel-outline')?.classList.contains('active')) loadOutline();
   if (push) pushHistory(path, line || d.cur, col);
+  revealFile(d.path);
 }
 
 // VS Code-style diff gutter for the normal file view. Fetches once per opened
@@ -176,6 +177,7 @@ export function switchTab(i) {
   render(); updateStatus();
   if ($('#panel-outline')?.classList.contains('active')) loadOutline();
   pushHistory(S.tabs[i].path, S.tabs[i].cur);
+  revealFile(S.tabs[i].path);
 }
 
 export function drawCrumbs() {

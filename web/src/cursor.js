@@ -1,10 +1,11 @@
 // web/src/cursor.js
-import { $, S, doc_, MOD, LH } from './state.js';
+import { $, S, doc_, MOD, LH, api } from './state.js';
 import { vp, rowsEl } from './ui.js';
 import { paint, render, rowFor, placeCaret } from './renderer.js';
 import { updateStatus } from './status.js';
 import { gotoDefinition } from './lsp.js';
 import { pushHistory } from './history.js';
+import { openFile } from './tabs.js';
 
 export const WORD = /[A-Za-z0-9_$]/;
 
@@ -43,6 +44,128 @@ export function wordAtPoint(x, y) {
   if (a === b) return null;
   const d = doc_();
   return { word: full.slice(a, b), line: +row.dataset.l, col: a, path: d && d.path };
+}
+
+/* Returns { target, line, col, startCol, endCol, path } when the point lies
+   inside a quoted import/file path string (e.g. './state.js', "pkg/foo", `docs/guide.md`),
+   angle-bracketed include, or markdown link target. */
+export function pathAtPoint(x, y) {
+  let node, off;
+  if (document.caretPositionFromPoint) {
+    const p = document.caretPositionFromPoint(x, y);
+    if (!p) return null;
+    node = p.offsetNode; off = p.offset;
+  } else if (document.caretRangeFromPoint) {
+    const r = document.caretRangeFromPoint(x, y);
+    if (!r) return null;
+    node = r.startContainer; off = r.startOffset;
+  } else return null;
+  if (!node || node.nodeType !== 3) return null;
+
+  const code = node.parentElement && node.parentElement.closest('.c');
+  const row = code && code.closest('.row');
+  if (!code || !row) return null;
+
+  let col = 0;
+  const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (n === node) { col += off; break; }
+    col += n.nodeValue.length;
+  }
+
+  const full = code.textContent;
+  if (!full || col < 0 || col > full.length) return null;
+
+  // 1. Check if inside quotes: '...', "...", `...`
+  let quoteStart = -1, quoteChar = '';
+  for (let i = col - 1; i >= 0; i--) {
+    const ch = full[i];
+    if (ch === "'" || ch === '"' || ch === '`') {
+      let backslashes = 0;
+      for (let j = i - 1; j >= 0 && full[j] === '\\'; j--) backslashes++;
+      if (backslashes % 2 === 0) { quoteStart = i; quoteChar = ch; break; }
+    }
+  }
+
+  if (quoteStart >= 0) {
+    let quoteEnd = -1;
+    for (let i = col; i < full.length; i++) {
+      if (full[i] === quoteChar) {
+        let backslashes = 0;
+        for (let j = i - 1; j >= 0 && full[j] === '\\'; j--) backslashes++;
+        if (backslashes % 2 === 0) { quoteEnd = i; break; }
+      }
+    }
+    if (quoteEnd > quoteStart) {
+      const raw = full.slice(quoteStart + 1, quoteEnd).trim();
+      if (looksLikePath(raw)) {
+        const d = doc_();
+        return {
+          kind: 'path',
+          target: raw,
+          line: +row.dataset.l,
+          col: quoteStart + 1,
+          startCol: quoteStart + 1,
+          endCol: quoteEnd,
+          word: raw,
+          path: d && d.path,
+        };
+      }
+    }
+  }
+
+  // 2. Check if inside markdown link target: [text](path)
+  const parenStart = full.lastIndexOf('(', col);
+  if (parenStart >= 0) {
+    const parenEnd = full.indexOf(')', col);
+    if (parenEnd > parenStart) {
+      const raw = full.slice(parenStart + 1, parenEnd).trim();
+      if (looksLikePath(raw)) {
+        const d = doc_();
+        return {
+          kind: 'path',
+          target: raw,
+          line: +row.dataset.l,
+          col: parenStart + 1,
+          startCol: parenStart + 1,
+          endCol: parenEnd,
+          word: raw,
+          path: d && d.path,
+        };
+      }
+    }
+  }
+
+  // 3. Check if inside angle brackets: #include <foo.h>
+  const angleStart = full.lastIndexOf('<', col);
+  if (angleStart >= 0) {
+    const angleEnd = full.indexOf('>', col);
+    if (angleEnd > angleStart) {
+      const raw = full.slice(angleStart + 1, angleEnd).trim();
+      if (looksLikePath(raw)) {
+        const d = doc_();
+        return {
+          kind: 'path',
+          target: raw,
+          line: +row.dataset.l,
+          col: angleStart + 1,
+          startCol: angleStart + 1,
+          endCol: angleEnd,
+          word: raw,
+          path: d && d.path,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function looksLikePath(s) {
+  if (!s || s.length < 2 || s.length > 260) return false;
+  if (s.startsWith('http://') || s.startsWith('https://') || s.startsWith('mailto:') || s.startsWith('data:')) return false;
+  if (s.includes('/') || s.includes('\\') || s.startsWith('./') || s.startsWith('../')) return true;
+  return /\.(js|ts|tsx|jsx|mjs|cjs|go|py|rs|java|c|h|cpp|hpp|cc|json|css|html|md|markdown|yaml|yml|toml|sql|sh|txt)$/i.test(s);
 }
 
 /* Column (UTF-16 units into the line's text) under a point. Clicking the gutter
@@ -127,12 +250,35 @@ export function initCursor() {
     // The clicked identifier is what F12, Shift+F12 and Alt+Shift+H act on.
     S.at = w;
     if (w) S.lastWord = w.word;
-    if (e[MOD] && w) {
-      e.preventDefault();
-      S.at = w; S.lastWord = w.word;
-      pushHistory(d.path, d.cur); // so Alt+Left returns to the call site
-      gotoDefinition(w);
-      return;
+    if (e[MOD]) {
+      const pHit = pathAtPoint(e.clientX, e.clientY);
+      if (pHit) {
+        e.preventDefault();
+        api('/api/resolve', { from: d.path, target: pHit.target }).then(res => {
+          if (res && res.found && res.path) {
+            pushHistory(d.path, d.cur);
+            openFile(res.path, { line: res.line || 1 });
+          } else if (w) {
+            S.at = w; S.lastWord = w.word;
+            pushHistory(d.path, d.cur);
+            gotoDefinition(w);
+          }
+        }).catch(() => {
+          if (w) {
+            S.at = w; S.lastWord = w.word;
+            pushHistory(d.path, d.cur);
+            gotoDefinition(w);
+          }
+        });
+        return;
+      }
+      if (w) {
+        e.preventDefault();
+        S.at = w; S.lastWord = w.word;
+        pushHistory(d.path, d.cur); // so Alt+Left returns to the call site
+        gotoDefinition(w);
+        return;
+      }
     }
     for (const r of rowsEl.children) r.classList.toggle('cur', +r.dataset.l === d.cur);
   });

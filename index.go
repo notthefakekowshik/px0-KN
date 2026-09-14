@@ -80,6 +80,19 @@ func (ix *Index) Files() []FileEntry {
 	return ix.files
 }
 
+// HasFile reports whether rel is an indexed file in the workspace.
+// files is kept sorted by Path, so binary search finds it in O(log N).
+func (ix *Index) HasFile(rel string) bool {
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	rel = strings.TrimPrefix(rel, "/")
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	i := sort.Search(len(ix.files), func(i int) bool {
+		return ix.files[i].Path >= rel
+	})
+	return i < len(ix.files) && ix.files[i].Path == rel
+}
+
 // Children lists a directory for the tree. Ignored directories are never walked,
 // so their contents are read from disk on demand, all marked ignored: git cannot
 // re-include anything beneath an excluded directory either.

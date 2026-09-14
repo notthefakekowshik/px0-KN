@@ -57,6 +57,7 @@ func NewServer(ix *Index, lsp *lspManager) *Server {
 	s.mux.HandleFunc("/api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("/api/tree", s.handleTree)
 	s.mux.HandleFunc("/api/find", s.handleFind)
+	s.mux.HandleFunc("/api/resolve", s.handleResolve)
 	s.mux.HandleFunc("/api/file", s.handleFile)
 	s.mux.HandleFunc("/api/close", s.handleClose)
 	s.mux.HandleFunc("/api/raw", s.handleRaw)
@@ -443,6 +444,13 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 		res = []FuzzyResult{}
 	}
 	writeJSON(w, map[string]any{"results": res})
+}
+
+func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
+	from := r.URL.Query().Get("from")
+	target := r.URL.Query().Get("target")
+	res := resolveTarget(s.ix, from, target)
+	writeJSON(w, res)
 }
 
 var imageExt = map[string]bool{

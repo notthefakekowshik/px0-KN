@@ -192,7 +192,9 @@ export function decorate(first, last) {
   }
   if (S.link) {
     const row = rowFor(S.link.line);
-    if (row) wrapRange($('.c', row), S.link.col, S.link.col + S.link.word.length, 'link');
+    const start = S.link.startCol !== undefined ? S.link.startCol : S.link.col;
+    const end = S.link.endCol !== undefined ? S.link.endCol : S.link.col + S.link.word.length;
+    if (row) wrapRange($('.c', row), start, end, 'link');
   }
   if (S.find && S.find.hits.length) {
     const byLine = S.find.byLine;

@@ -20,7 +20,7 @@ function setLayoutPref(mode) {
   try { localStorage.setItem('px0.diffLayout', mode); } catch {}
 }
 
-function layoutPref() {
+export function layoutPref() {
   try { return localStorage.getItem('px0.diffLayout') || 'split'; } catch { return 'split'; }
 }
 
@@ -50,7 +50,7 @@ export async function toggleDiff() {
   const d = doc_();
   if (!d) return;
   if (!d.diffMode && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
-  setDiffMode(d.diffMode ? 'source' : layoutPref());
+  setDiffMode(d.diffMode ? 'source' : (layoutPref() || 'split'));
 }
 
 export async function setDiffMode(mode) {
@@ -59,8 +59,10 @@ export async function setDiffMode(mode) {
   if (mode !== 'source' && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
   if (mode === 'source') {
     d.diffMode = null;
+    d.diffDismissed = true;
   } else {
     d.diffMode = mode;
+    d.diffDismissed = false;
     setLayoutPref(mode);
   }
   syncPreview(); // markdown preview and diff view are mutually exclusive
@@ -227,11 +229,25 @@ function codeCell(text) {
 
 export function initDiff() {
   const sw = $('#diff-switch');
-  sw.addEventListener('mousedown', e => e.preventDefault());
-  sw.addEventListener('click', e => {
-    const b = e.target.closest('[data-diff]');
-    if (!b) return;
-    // Only Split/Unified are buttons; clicking the one already active exits to source.
-    setDiffMode(b.dataset.diff === diffMode() ? 'source' : b.dataset.diff);
+  if (!sw) return;
+  sw.addEventListener('mousedown', e => {
+    if (!e.target.closest('button')) e.preventDefault();
   });
+  const btn = $('#diff-btn');
+  if (btn) {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      toggleDiff();
+    });
+  }
+  const menu = $('#diff-menu');
+  if (menu) {
+    menu.addEventListener('click', e => {
+      const item = e.target.closest('[data-diff-opt]');
+      if (!item) return;
+      e.stopPropagation();
+      setDiffMode(item.dataset.diffOpt);
+      item.blur();
+    });
+  }
 }

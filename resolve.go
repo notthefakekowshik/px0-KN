@@ -23,9 +23,9 @@ var probeIndexes = []string{
 	"/__init__.py", "/main.go", "/mod.rs",
 }
 
-// resolveTarget attempts to resolve a referenced path from a source file into
+// resolveImportTarget attempts to resolve a referenced path from a source file into
 // an indexed workspace path.
-func resolveTarget(ix *Index, fromRel, target string) ResolveResult {
+func resolveImportTarget(ix *Index, fromRel, target string) ResolveResult {
 	target = strings.TrimSpace(target)
 	if idx := strings.Index(target, "]("); idx >= 0 {
 		target = strings.TrimSuffix(target[idx+2:], ")")

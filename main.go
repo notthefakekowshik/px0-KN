@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +40,7 @@ func main() {
 		noTelemetry  = flag.Bool("no-telemetry", false, "disable anonymous usage telemetry")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage: px0 [flags] [directory]\n\nflags:\n", version)
+		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage: px0 [flags] [file or directory]\n\nflags:\n", version)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -76,16 +78,9 @@ func main() {
 	if flag.NArg() > 0 {
 		target = flag.Arg(0)
 	}
-	root, err := filepath.Abs(target)
+	root, initialFile, initialLine, err := resolveTarget(target)
 	if err != nil {
 		fatal(err)
-	}
-	if st, err := os.Stat(root); err != nil || !st.IsDir() {
-		fatal(fmt.Errorf("not a directory: %s", root))
-	}
-	// Resolve symlinks so the traversal guard compares like with like.
-	if resolved, err := filepath.EvalSymlinks(root); err == nil {
-		root = resolved
 	}
 
 	ln, addr, err := listen(*host, *port)
@@ -100,7 +95,7 @@ func main() {
 
 	srv := &http.Server{Handler: NewServer(ix, lsp)}
 
-	url := "http://" + addr
+	url := viewerURL(addr, initialFile, initialLine)
 	uiHeading("px0 "+version, nil, os.Stdout)
 	uiKV("workspace", root, 11, os.Stdout)
 	uiKV("url", uiAccent(url, os.Stdout), 11, os.Stdout)
@@ -164,6 +159,106 @@ func main() {
 	}
 }
 
+// resolveTarget turns a directory or file into a workspace root, along with an optional
+// initial file to open and optional line number.
+// If the target is inside a git repository, that repository root is used as the workspace root.
+// Otherwise, for relative paths within the current working directory, the working directory
+// is used. Standalone files fall back to their parent directory.
+func resolveTarget(target string) (root, initialFile string, initialLine int, err error) {
+	cleanedTarget, line := splitTargetLine(target)
+	abs, err := filepath.Abs(cleanedTarget)
+	if err != nil {
+		return "", "", 0, err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("invalid target %s: %w", abs, err)
+	}
+	st, err := os.Stat(resolved)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("invalid target %s: %w", abs, err)
+	}
+	if st.IsDir() {
+		return resolved, "", 0, nil
+	}
+	if !st.Mode().IsRegular() {
+		return "", "", 0, fmt.Errorf("not a regular file or directory: %s", abs)
+	}
+
+	parentDir := filepath.Dir(resolved)
+
+	// If the file is inside a git repository, use the git repo root.
+	if info := gitProbe(parentDir); info.ok && info.toplevel != "" {
+		if rel, err := filepath.Rel(info.toplevel, resolved); err == nil && !strings.HasPrefix(rel, "..") && rel != "." {
+			return info.toplevel, filepath.ToSlash(rel), line, nil
+		}
+	}
+
+	// If the target was specified as a relative path within the current working directory,
+	// use the current working directory as the workspace root.
+	if !filepath.IsAbs(cleanedTarget) {
+		if wd, err := os.Getwd(); err == nil {
+			if resolvedWd, err := filepath.EvalSymlinks(wd); err == nil {
+				if rel, err := filepath.Rel(resolvedWd, resolved); err == nil && !strings.HasPrefix(rel, "..") && rel != "." {
+					return resolvedWd, filepath.ToSlash(rel), line, nil
+				}
+			}
+		}
+	}
+
+	return parentDir, filepath.Base(resolved), line, nil
+}
+
+// splitTargetLine separates trailing :line or :line:col from target if the candidate path exists.
+func splitTargetLine(target string) (path string, line int) {
+	if _, err := os.Stat(target); err == nil {
+		return target, 0
+	}
+	lastColon := strings.LastIndex(target, ":")
+	if lastColon <= 0 {
+		return target, 0
+	}
+	vol := filepath.VolumeName(target)
+	if lastColon <= len(vol) {
+		return target, 0
+	}
+	suffix := target[lastColon+1:]
+	num, err := strconv.Atoi(suffix)
+	if err != nil || num <= 0 {
+		return target, 0
+	}
+	rest := target[:lastColon]
+	secondColon := strings.LastIndex(rest, ":")
+	if secondColon > len(vol) {
+		secondSuffix := rest[secondColon+1:]
+		if lineNum, err := strconv.Atoi(secondSuffix); err == nil && lineNum > 0 {
+			candidate := rest[:secondColon]
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate, lineNum
+			}
+		}
+	}
+	if _, err := os.Stat(rest); err == nil {
+		return rest, num
+	}
+	return target, 0
+}
+
+func viewerURL(addr, initialFile string, initialLine int) string {
+	u := url.URL{Scheme: "http", Host: addr}
+	q := u.Query()
+	if initialFile != "" {
+		q.Set("path", filepath.ToSlash(initialFile))
+	}
+	if initialLine > 0 {
+		q.Set("line", strconv.Itoa(initialLine))
+	}
+	if len(q) > 0 {
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
 // listen binds the requested port, walking forward if it is already taken so a
 // second instance does not simply fail. If a block of ports is busy, it falls
 // back to an OS-assigned free port.
@@ -208,6 +303,11 @@ func openBrowser(url string) {
 	default:
 		// On Linux/Unix, detect WSL to open the browser on the Windows host seamlessly
 		if isWSL() {
+			// WSL2's localhost port-forwarding relay needs a moment to notice a
+			// freshly bound listener before Windows can reach it. Without this,
+			// the browser can open before the relay catches up and shows a
+			// connection error until the next reload.
+			time.Sleep(500 * time.Millisecond)
 			cmds = append(cmds,
 				exec.Command("wslview", url),
 				exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Start-Process", fmt.Sprintf(`"%s"`, url)),

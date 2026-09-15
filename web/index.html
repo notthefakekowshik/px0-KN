@@ -94,9 +94,30 @@
         <button data-md="source" title="Source code ({Alt+M})">Source</button>
       </div>
       <!-- Modified files in a git repo only: view the file's diff against HEAD -->
-      <div id="diff-switch" class="view-switch" role="group" aria-label="Diff view" hidden>
-        <button data-diff="split" title="Split diff ({Mod+D})">Split</button>
-        <button data-diff="unified" title="Unified diff ({Mod+D})">Unified</button>
+      <div id="diff-switch" class="view-switch diff-dropdown" role="group" aria-label="Diff view" hidden>
+        <button id="diff-btn" title="Toggle diff ({Mod+D})">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="diff-btn-icon"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="9" r="2.5"/><path d="M6 8.5v7M18 11.5c0 3-3 3.5-6 3.5"/></svg>
+          <span class="diff-btn-label">Diff</span>
+          <svg viewBox="0 0 10 10" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="diff-caret"><path d="M2 3.5L5 6.5L8 3.5"/></svg>
+        </button>
+        <div id="diff-menu" class="diff-menu" role="menu">
+          <div class="diff-menu-header">Diff View Mode</div>
+          <button type="button" class="diff-menu-item" data-diff-opt="split" role="menuitem">
+            <span class="diff-item-check" aria-hidden="true">✓</span>
+            <div class="diff-item-content">
+              <span class="diff-item-title">Split</span>
+              <span class="diff-item-desc">Side-by-side</span>
+            </div>
+            <span class="diff-item-badge">Default</span>
+          </button>
+          <button type="button" class="diff-menu-item" data-diff-opt="unified" role="menuitem">
+            <span class="diff-item-check" aria-hidden="true">✓</span>
+            <div class="diff-item-content">
+              <span class="diff-item-title">Unified</span>
+              <span class="diff-item-desc">Inline unified</span>
+            </div>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -200,6 +221,7 @@
         <button class="inspector-tab active" data-itab="refs" title="View references across workspace">References</button>
         <button class="inspector-tab" data-itab="symbols" title="View file symbols outline">Symbols</button>
         <button class="inspector-tab" data-itab="calls" title="Trace callers and callees ({Alt+Shift+H})">Calls</button>
+        <button class="inspector-tab" data-itab="search" title="Search text across workspace ({Mod+Shift+F})">Search</button>
       </div>
       <div class="inspector-head-actions">
         <button id="btn-close-right" class="mini" title="Close inspector (Esc)">&#10005;</button>
@@ -236,6 +258,22 @@
       </div>
       <div class="panel-body" id="right-calls-list">
         <div class="hint">Click a function name, then press <b data-keys="Alt+Shift+H"></b> to trace its calls.</div>
+      </div>
+    </section>
+
+    <!-- Right Pane 4: Full-text search across the workspace -->
+    <section class="inspector-pane" id="pane-right-search">
+      <div class="search-form">
+        <input id="q" type="text" spellcheck="false" placeholder="Search in files" autocomplete="off">
+        <div class="opts">
+          <button class="opt" id="o-case" title="Match case">Aa</button>
+          <button class="opt" id="o-word" title="Whole word">|ab|</button>
+          <button class="opt" id="o-re" title="Regular expression">.*</button>
+        </div>
+        <input id="glob" type="text" spellcheck="false" placeholder="files to include e.g. *.go" autocomplete="off">
+      </div>
+      <div class="panel-body" id="results">
+        <div class="hint">Search text across every indexed file.</div>
       </div>
     </section>
   </aside>

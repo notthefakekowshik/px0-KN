@@ -14,7 +14,7 @@ px0 is engineered as an ultra-fast, zero-overhead code exploration console. Its 
 
 ## 2. Startup Pipeline (<1 ms Critical Path)
 
-When `px0` is executed in a terminal (e.g., `px0 .`), the initialization flow executes as follows:
+When `px0` is executed in a terminal (e.g., `px0 .` or `px0 main.go:42`), the initialization flow executes as follows. A file target detects its enclosing project repository (or working directory) as the workspace and is passed to the browser with its relative path and optional line number.
 
 ```mermaid
 sequenceDiagram
@@ -41,6 +41,7 @@ sequenceDiagram
 
 ### Key Stages in [`main.go`](../../main.go)
 
+1. Target Resolution: Directories become workspace roots. For a file target, its repository or project root is detected as the workspace, and its relative path (with optional line number) is retained for the initial browser tab.
 1. Socket Binding: `listen(*host, *port)` binds an ephemeral or user-specified TCP socket immediately.
 1. Instant Root Tree Extraction: Before descending into subdirectories, `ix.Build()` extracts and populates the root directory entries (`dir=""`), publishing them directly to `ix.children[""]`. When the browser makes its initial request to `/api/tree`, it immediately renders the root tree nodes without waiting for the deep repository scan to finish.
 1. Non-Blocking Browser Launch: `go openBrowser(url)` spawns the platform-specific browser opener (`xdg-open` on Linux, `open` on macOS, `rundll32` on Windows) in a separate goroutine.
@@ -71,7 +72,7 @@ The server is implemented in [`server.go`](../../server.go) using Go's standard 
 | `/api/def`            | `GET`  | Quick definition lookup fallback                                        | JSON array of matching definition locations|
 | `/api/diff`           | `GET`  | Unified diff of working tree vs. `HEAD` (`?path=...`)                   | JSON (`{path, diff, available}`)           |
 | `/api/gutter`         | `GET`  | Per-line change markers for code view gutter                            | JSON (`{added, modified, deleted}`)        |
-| `/api/reindex`        | `POST` | Re-runs index walk and git status on demand                             | JSON (`{ok: true, files: ...}`)            |
+| `/api/reindex`        | `POST` | Re-runs index walk and git status on demand (triggers frontend tab reload; see [`file-reload-and-updates.md`](file-reload-and-updates.md)) | JSON (`{files, indexMs}`)                  |
 | `/api/lsp/def`        | `GET`  | Go-to-Definition via LSP (`?path=...&line=...&col=...`)                 | JSON array of target locations             |
 | `/api/lsp/refs`       | `GET`  | Find References via LSP                                                 | JSON array of reference locations          |
 | `/api/lsp/calls`      | `POST` | Incoming/outgoing call hierarchy tree expansion                         | JSON array of `CallNode` objects           |
@@ -155,3 +156,7 @@ The `/api/lsp/install` and `/api/lsp/start` endpoints execute shell commands (e.
 1. The request `Origin` header must match the request `Host` header.
 1. The `Host` header is validated to ensure it is strictly an IP address (`127.0.0.1`, `[::1]`) or `localhost`. This prevents DNS-rebinding attacks.
 1. The executed command is never supplied by the client; it is looked up exclusively from the hard-coded internal `lspRegistry`.
+
+### Self-Update Integrity
+
+Before `px0 --update` executes or installs a release binary, it verifies the download against the SHA-256 digest in that release's `checksums.txt` asset. Missing, malformed, or mismatched checksum data aborts the update without replacing the current executable.

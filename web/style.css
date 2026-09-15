@@ -239,9 +239,65 @@ body.right-hidden #right-side, body.right-hidden #right-resizer { display: none;
 .view-switch button { padding: 0 9px; border-radius: 3px; font-size: 11px; line-height: 18px; color: var(--dim); }
 .view-switch button:hover { color: var(--fg); }
 .view-switch button.on { background: var(--bg); color: var(--accent-fg); font-weight: 600; }
+
+/* Diff dropdown & view-mode menu */
+.diff-dropdown { position: relative; }
+.diff-dropdown #diff-btn {
+  display: inline-flex; align-items: center; gap: 4px; padding: 0 6px 0 7px;
+}
+.diff-dropdown #diff-btn .diff-btn-icon { flex: none; }
+.diff-dropdown #diff-btn .diff-caret { flex: none; opacity: .7; transition: transform .15s ease; }
+.diff-dropdown:hover #diff-btn .diff-caret,
+.diff-dropdown.open #diff-btn .diff-caret { transform: rotate(180deg); }
+
+.diff-menu {
+  position: absolute; top: calc(100% + 4px); right: 0; min-width: 175px;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: var(--shadow, 0 6px 20px rgba(0, 0, 0, 0.28));
+  padding: 4px; z-index: 50; display: none; flex-direction: column; gap: 1px;
+}
+.diff-menu::before {
+  content: ""; position: absolute; top: -6px; left: 0; right: 0; height: 6px;
+}
+.diff-dropdown:hover .diff-menu,
+.diff-dropdown:focus-within .diff-menu,
+.diff-dropdown.open .diff-menu {
+  display: flex; animation: diffMenuIn .1s ease-out;
+}
+@keyframes diffMenuIn {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.diff-menu-header {
+  padding: 4px 8px 3px; font-size: 9.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--faint);
+  border-bottom: 1px solid var(--line); margin-bottom: 3px;
+}
+.diff-menu-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 5px 8px; border-radius: 4px; border: 0; background: none;
+  font-size: 11.5px; line-height: 1.3; color: var(--dim); cursor: pointer; text-align: left;
+}
+.diff-menu-item:hover { background: var(--bg3); color: var(--fg); }
+.diff-menu-item.active { background: var(--bg3); color: var(--accent-fg); font-weight: 500; }
+.diff-item-check {
+  width: 12px; font-size: 11px; flex: none; text-align: center;
+  color: var(--accent); visibility: hidden;
+}
+.diff-menu-item.active .diff-item-check { visibility: visible; }
+.diff-item-content { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.diff-item-title { font-weight: 600; font-size: 11.5px; color: var(--fg); }
+.diff-item-desc { font-size: 10px; color: var(--dim); margin-top: 1px; }
+.diff-item-badge {
+  font-size: 9px; padding: 1px 4px; border-radius: 3px; background: var(--bg4);
+  color: var(--dim); margin-left: auto; text-transform: uppercase; letter-spacing: .04em;
+}
+.diff-menu-item.active .diff-item-badge { background: var(--accent); color: var(--on-accent); }
+
 body.md-tab #tabs { padding-right: 140px; }
-body.diff-tab #tabs { padding-right: 172px; }
-body.md-tab.diff-tab #tabs { padding-right: 304px; }
+body.diff-tab #tabs { padding-right: 95px; }
+body.md-tab.diff-tab #tabs { padding-right: 230px; }
 
 #tabs { display: flex; height: 28px; background: var(--bg2); border-bottom: 1px solid var(--line); overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 #tabs::-webkit-scrollbar { display: none; }

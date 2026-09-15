@@ -264,6 +264,16 @@ func TestGitGutter(t *testing.T) {
 	if code != 200 || body["available"] != false {
 		t.Errorf("untracked: status=%d available=%v, want 200/false", code, body["available"])
 	}
+
+	// Verify /api/file also reports diffAvailable immediately on file load.
+	_, fileBody := get(t, s, "/api/file?path=f.go")
+	if fileBody["diffAvailable"] != true {
+		t.Errorf("f.go diffAvailable = %v, want true", fileBody["diffAvailable"])
+	}
+	_, cleanBody := get(t, s, "/api/file?path=clean.go")
+	if cleanBody["diffAvailable"] != false {
+		t.Errorf("clean.go diffAvailable = %v, want false", cleanBody["diffAvailable"])
+	}
 }
 
 func BenchmarkGitStatus(b *testing.B) {

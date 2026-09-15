@@ -4,6 +4,7 @@ import { layout, render } from './renderer.js';
 import { updateStatus } from './status.js';
 import { loadOutline } from './outline.js';
 import { treeEl, openDirs, drawTree } from './tree.js';
+import { reloadOpenTabs } from './tabs.js';
 
 export function showPanel(name) {
   document.body.classList.remove('side-hidden');
@@ -35,6 +36,8 @@ export function initPanels() {
     S.meta.files = j.files; S.meta.indexMs = j.indexMs;
     treeEl.innerHTML = ''; openDirs.clear();
     await drawTree('', treeEl, 0);
+    // Reindex is a refresh: re-fetch open tabs quietly in place without tab switching.
+    await reloadOpenTabs();
     updateStatus();
   });
 

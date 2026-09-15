@@ -628,8 +628,8 @@ async function revealDir(dir) {
 
 async function revealFile(path) {
   if (!path) return;
-  const dir = path.slice(0, path.lastIndexOf('/'));
-  if (dir) await revealDir(dir);
+  const idx = path.lastIndexOf('/');
+  if (idx > 0) await revealDir(path.slice(0, idx));
   const row = treeEl.querySelector('[data-file="' + CSS.escape(path) + '"]');
   if (row) {
     $$('.tr.sel', treeEl).forEach(x => x.classList.remove('sel'));
@@ -677,6 +677,7 @@ function initTree() {
 
 
 
+
 function showPanel(name) {
   document.body.classList.remove('side-hidden');
   const filesPanel = $('#panel-files');
@@ -707,6 +708,8 @@ function initPanels() {
     S.meta.files = j.files; S.meta.indexMs = j.indexMs;
     treeEl.innerHTML = ''; openDirs.clear();
     await drawTree('', treeEl, 0);
+    // Reindex is a refresh: re-fetch open tabs quietly in place without tab switching.
+    await reloadOpenTabs();
     updateStatus();
   });
 
@@ -956,10 +959,12 @@ function setRightInspectorTab(tab) {
   $('#pane-right-refs')?.classList.toggle('active', tab === 'refs');
   $('#pane-right-symbols')?.classList.toggle('active', tab === 'symbols');
   $('#pane-right-calls')?.classList.toggle('active', tab === 'calls');
+  $('#pane-right-search')?.classList.toggle('active', tab === 'search');
   if (tab === 'symbols') {
     loadOutline();
     $('#right-symbols-filter')?.focus();
   }
+  if (tab === 'search') $('#q')?.focus();
 }
 
 function renderRightResults(word, hits, server, isExact) {
@@ -1110,7 +1115,6 @@ function initInspector() {
 
 
 
-
 /* Language servers answer precisely but can take a long time to wake up, while
    the regex index answers in milliseconds and is always there. So: use the
    server when it is actually ready, fall back to text matching when it is not,
@@ -1230,7 +1234,7 @@ function showHits(word, hits, server, noun, refCount) {
   head += server ? '  ·  ' + server : '  ·  text match, no language server';
   if (refCount) head += '  ·  ' + refCount + ' other references';
   renderResults({ results: groupHits(hits), files: 0, total: n, header: head, exact: !!server });
-  showPanel('search');
+  showRightInspector('search');
 }
 
 function groupHits(hits) {
@@ -2478,6 +2482,257 @@ function initMarkdown() {
   });
 }
 
+// --- File: web/src/diff.js ---
+// web/src/diff.js
+// Git diff view for the active tab: renders the file's unified diff against
+// HEAD in a dedicated overlay (like the Markdown preview), in either a
+// side-by-side split layout (default) or a single-column unified layout.
+// Unlike the code viewport this is not virtualized -- a file's own diff is
+// bounded in size, so a plain DOM render is simple and fast enough.
+const diffview = $('#diffview');
+const diffContent = $('#diffcontent');
+
+let shown = null; // doc the diff view is currently showing, null while hidden
+
+// d.diffMode is 'split' | 'unified' | null (off), per tab. The layout last
+// picked (split vs unified) is remembered globally as the default for the
+// next file entering diff view.
+function setLayoutPref(mode) {
+  try { localStorage.setItem('px0.diffLayout', mode); } catch {}
+}
+
+function layoutPref() {
+  try { return localStorage.getItem('px0.diffLayout') || 'split'; } catch { return 'split'; }
+}
+
+function diffMode(d = doc_()) {
+  return (d && d.diffMode) || null;
+}
+
+/* Show or hide the diff overlay to match the active tab, and re-render when
+   the layout (split/unified) changes while already showing the same doc --
+   switching layout doesn't change which doc is "shown", so that alone can't
+   be the signal to redraw. Call whenever either might have changed. */
+function syncDiffView() {
+  const d = doc_();
+  const want = (d && d.diffMode) ? d : null;
+  if (want !== shown) {
+    shown = want;
+    diffview.hidden = !want;
+    if (want) drawDiff(want);
+    else diffContent.replaceChildren();
+  } else if (want && want.diffHunks !== undefined) {
+    renderDiff(want);
+  }
+}
+
+async function toggleDiff() {
+  if (!S.meta?.git) return;
+  const d = doc_();
+  if (!d) return;
+  if (!d.diffMode && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
+  setDiffMode(d.diffMode ? 'source' : (layoutPref() || 'split'));
+}
+
+async function setDiffMode(mode) {
+  const d = doc_();
+  if (!d) return;
+  if (mode !== 'source' && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
+  if (mode === 'source') {
+    d.diffMode = null;
+    d.diffDismissed = true;
+  } else {
+    d.diffMode = mode;
+    d.diffDismissed = false;
+    setLayoutPref(mode);
+  }
+  syncPreview(); // markdown preview and diff view are mutually exclusive
+  syncDiffView();
+  updateStatus();
+}
+
+async function drawDiff(d) {
+  if (d.diffText === undefined) {
+    diffContent.replaceChildren();
+    try {
+      d.diffReq = d.diffReq || api('/api/diff', { path: d.path });
+      const j = await d.diffReq;
+      d.diffText = j.diff || '';
+      d.diffHunks = parseDiff(d.diffText);
+    } catch (e) {
+      d.diffText = '';
+      d.diffHunks = [];
+      setStatusNote('No diff: ' + e.message);
+    } finally {
+      d.diffReq = null;
+    }
+    if (shown !== d) return;
+  }
+  renderDiff(d);
+}
+
+function renderDiff(d) {
+  diffContent.replaceChildren();
+  if (!d.diffHunks || !d.diffHunks.length) {
+    const p = document.createElement('div');
+    p.className = 'diff-empty';
+    p.textContent = 'No changes against HEAD.';
+    diffContent.append(p);
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const hunk of d.diffHunks) {
+    frag.append(hunkHeader(hunk));
+    frag.append(d.diffMode === 'unified' ? unifiedTable(hunk) : splitTable(hunk));
+  }
+  diffContent.append(frag);
+}
+
+function hunkHeader(hunk) {
+  const el = document.createElement('div');
+  el.className = 'diff-hunk-head';
+  el.textContent = '@@ -' + hunk.oldStart + ' +' + hunk.newStart + ' @@' + (hunk.section ? ' ' + hunk.section : '');
+  return el;
+}
+
+/* ---------- unified diff parsing ---------- */
+
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ \t]?(.*)$/;
+
+// Parses a unified diff (as returned by `git diff`) into hunks, each a flat
+// list of rows tagged ctx/add/del carrying old- and/or new-file line numbers.
+// File headers (diff --git, index, ---, +++) are skipped: nothing before the
+// first @@ is kept.
+function parseDiff(text) {
+  if (!text) return [];
+  const hunks = [];
+  let cur = null, oldLine = 0, newLine = 0;
+  for (const line of text.split('\n')) {
+    const m = HUNK_RE.exec(line);
+    if (m) {
+      oldLine = +m[1];
+      newLine = +m[3];
+      cur = { oldStart: oldLine, newStart: newLine, section: m[5] || '', rows: [] };
+      hunks.push(cur);
+      continue;
+    }
+    if (!cur || line === '' || line.startsWith('\\')) continue; // trailing split artifact, pre-hunk header, or "\ No newline..."
+    const c = line[0], body = line.slice(1);
+    if (c === '+') cur.rows.push({ type: 'add', newLine: newLine++, text: body });
+    else if (c === '-') cur.rows.push({ type: 'del', oldLine: oldLine++, text: body });
+    else cur.rows.push({ type: 'ctx', oldLine: oldLine++, newLine: newLine++, text: body });
+  }
+  return hunks;
+}
+
+/* ---------- unified layout: one row per diff line ---------- */
+
+function unifiedTable(hunk) {
+  const table = document.createElement('div');
+  table.className = 'diff-table diff-unified';
+  for (const row of hunk.rows) {
+    const r = document.createElement('div');
+    r.className = 'diff-row diff-' + row.type;
+    r.append(
+      lineCell(row.type === 'add' ? '' : row.oldLine),
+      lineCell(row.type === 'del' ? '' : row.newLine),
+      markerCell(row.type),
+      codeCell(row.text),
+    );
+    table.append(r);
+  }
+  return table;
+}
+
+/* ---------- split layout: deletions and additions paired side by side ---------- */
+
+function splitTable(hunk) {
+  const table = document.createElement('div');
+  table.className = 'diff-table diff-split';
+  for (const pair of pairRows(hunk.rows)) {
+    const r = document.createElement('div');
+    r.className = 'diff-row-pair';
+    r.append(splitSide(pair.left, 'left'), splitSide(pair.right, 'right'));
+    table.append(r);
+  }
+  return table;
+}
+
+// Walks a hunk's flat row list, pairing each run of deletions with the run of
+// additions that immediately follows it (a "changed" block) index-by-index,
+// padding the shorter side with blanks. Context rows go straight across.
+function pairRows(rows) {
+  const pairs = [];
+  let i = 0;
+  while (i < rows.length) {
+    const row = rows[i];
+    if (row.type === 'ctx') { pairs.push({ left: row, right: row }); i++; continue; }
+    let dels = [], adds = [];
+    while (i < rows.length && rows[i].type === 'del') dels.push(rows[i++]);
+    while (i < rows.length && rows[i].type === 'add') adds.push(rows[i++]);
+    const n = Math.max(dels.length, adds.length);
+    for (let k = 0; k < n; k++) pairs.push({ left: dels[k] || null, right: adds[k] || null });
+  }
+  return pairs;
+}
+
+function splitSide(row, side) {
+  const el = document.createElement('div');
+  el.className = 'diff-side diff-side-' + side + (row ? ' diff-' + row.type : ' diff-blank');
+  if (!row) { el.append(lineCell(''), markerCell(''), codeCell('')); return el; }
+  const ln = side === 'left' ? row.oldLine : row.newLine;
+  el.append(lineCell(ln), markerCell(row.type), codeCell(row.text));
+  return el;
+}
+
+function lineCell(n) {
+  const el = document.createElement('div');
+  el.className = 'diff-ln';
+  el.textContent = n === '' || n === undefined ? '' : String(n);
+  return el;
+}
+
+const MARKS = { add: '+', del: '-', ctx: '' };
+
+function markerCell(type) {
+  const el = document.createElement('div');
+  el.className = 'diff-mk';
+  el.textContent = MARKS[type] || '';
+  return el;
+}
+
+function codeCell(text) {
+  const el = document.createElement('div');
+  el.className = 'diff-code';
+  el.innerHTML = esc(text || '') || '&nbsp;';
+  return el;
+}
+
+function initDiff() {
+  const sw = $('#diff-switch');
+  if (!sw) return;
+  sw.addEventListener('mousedown', e => {
+    if (!e.target.closest('button')) e.preventDefault();
+  });
+  const btn = $('#diff-btn');
+  if (btn) {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      toggleDiff();
+    });
+  }
+  const menu = $('#diff-menu');
+  if (menu) {
+    menu.addEventListener('click', e => {
+      const item = e.target.closest('[data-diff-opt]');
+      if (!item) return;
+      e.stopPropagation();
+      setDiffMode(item.dataset.diffOpt);
+      item.blur();
+    });
+  }
+}
+
 // --- File: web/src/status.js ---
 function updateStatus() {
   const d = doc_();
@@ -2503,12 +2758,24 @@ function updateStatus() {
     for (const b of sw.children) b.classList.toggle('on', isPreviewable && (b.dataset.md === 'preview') === shown);
   }
 
-  const hasDiff = !!(d && d.diffAvailable), mode = (d && d.diffMode) || 'source';
+  const hasDiff = !!(d && d.diffAvailable);
+  const isDiffOn = !!(d && d.diffMode);
+  const currentLayout = (d && d.diffMode) || layoutPref();
   const dsw = $('#diff-switch');
   if (dsw) {
     dsw.hidden = !hasDiff;
     document.body.classList.toggle('diff-tab', hasDiff);
-    for (const b of dsw.children) b.classList.toggle('on', hasDiff && b.dataset.diff === mode);
+    const btn = $('#diff-btn');
+    if (btn) {
+      btn.classList.toggle('on', hasDiff && isDiffOn);
+      btn.title = withKeys(isDiffOn
+        ? `Diff: active (${d.diffMode === 'unified' ? 'Unified' : 'Split'}) — click to show source ({Mod+D})`
+        : `Diff: off — click to show diff ({Mod+D})`);
+    }
+    const menuItems = dsw.querySelectorAll('.diff-menu-item');
+    for (const item of menuItems) {
+      item.classList.toggle('active', item.dataset.diffOpt === currentLayout);
+    }
   }
 
   const idxEl = $('#st-index');
@@ -2774,241 +3041,6 @@ function initSelectionBar() {
   });
 }
 
-// --- File: web/src/diff.js ---
-// web/src/diff.js
-// Git diff view for the active tab: renders the file's unified diff against
-// HEAD in a dedicated overlay (like the Markdown preview), in either a
-// side-by-side split layout (default) or a single-column unified layout.
-// Unlike the code viewport this is not virtualized -- a file's own diff is
-// bounded in size, so a plain DOM render is simple and fast enough.
-const diffview = $('#diffview');
-const diffContent = $('#diffcontent');
-
-let shown = null; // doc the diff view is currently showing, null while hidden
-
-// d.diffMode is 'split' | 'unified' | null (off), per tab. The layout last
-// picked (split vs unified) is remembered globally as the default for the
-// next file entering diff view.
-function setLayoutPref(mode) {
-  try { localStorage.setItem('px0.diffLayout', mode); } catch {}
-}
-
-function layoutPref() {
-  try { return localStorage.getItem('px0.diffLayout') || 'split'; } catch { return 'split'; }
-}
-
-function diffMode(d = doc_()) {
-  return (d && d.diffMode) || null;
-}
-
-/* Show or hide the diff overlay to match the active tab, and re-render when
-   the layout (split/unified) changes while already showing the same doc --
-   switching layout doesn't change which doc is "shown", so that alone can't
-   be the signal to redraw. Call whenever either might have changed. */
-function syncDiffView() {
-  const d = doc_();
-  const want = (d && d.diffMode) ? d : null;
-  if (want !== shown) {
-    shown = want;
-    diffview.hidden = !want;
-    if (want) drawDiff(want);
-    else diffContent.replaceChildren();
-  } else if (want && want.diffHunks !== undefined) {
-    renderDiff(want);
-  }
-}
-
-async function toggleDiff() {
-  if (!S.meta?.git) return;
-  const d = doc_();
-  if (!d) return;
-  if (!d.diffMode && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
-  setDiffMode(d.diffMode ? 'source' : layoutPref());
-}
-
-async function setDiffMode(mode) {
-  const d = doc_();
-  if (!d) return;
-  if (mode !== 'source' && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
-  if (mode === 'source') {
-    d.diffMode = null;
-  } else {
-    d.diffMode = mode;
-    setLayoutPref(mode);
-  }
-  syncPreview(); // markdown preview and diff view are mutually exclusive
-  syncDiffView();
-  updateStatus();
-}
-
-async function drawDiff(d) {
-  if (d.diffText === undefined) {
-    diffContent.replaceChildren();
-    try {
-      d.diffReq = d.diffReq || api('/api/diff', { path: d.path });
-      const j = await d.diffReq;
-      d.diffText = j.diff || '';
-      d.diffHunks = parseDiff(d.diffText);
-    } catch (e) {
-      d.diffText = '';
-      d.diffHunks = [];
-      setStatusNote('No diff: ' + e.message);
-    } finally {
-      d.diffReq = null;
-    }
-    if (shown !== d) return;
-  }
-  renderDiff(d);
-}
-
-function renderDiff(d) {
-  diffContent.replaceChildren();
-  if (!d.diffHunks || !d.diffHunks.length) {
-    const p = document.createElement('div');
-    p.className = 'diff-empty';
-    p.textContent = 'No changes against HEAD.';
-    diffContent.append(p);
-    return;
-  }
-  const frag = document.createDocumentFragment();
-  for (const hunk of d.diffHunks) {
-    frag.append(hunkHeader(hunk));
-    frag.append(d.diffMode === 'unified' ? unifiedTable(hunk) : splitTable(hunk));
-  }
-  diffContent.append(frag);
-}
-
-function hunkHeader(hunk) {
-  const el = document.createElement('div');
-  el.className = 'diff-hunk-head';
-  el.textContent = '@@ -' + hunk.oldStart + ' +' + hunk.newStart + ' @@' + (hunk.section ? ' ' + hunk.section : '');
-  return el;
-}
-
-/* ---------- unified diff parsing ---------- */
-
-const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ \t]?(.*)$/;
-
-// Parses a unified diff (as returned by `git diff`) into hunks, each a flat
-// list of rows tagged ctx/add/del carrying old- and/or new-file line numbers.
-// File headers (diff --git, index, ---, +++) are skipped: nothing before the
-// first @@ is kept.
-function parseDiff(text) {
-  if (!text) return [];
-  const hunks = [];
-  let cur = null, oldLine = 0, newLine = 0;
-  for (const line of text.split('\n')) {
-    const m = HUNK_RE.exec(line);
-    if (m) {
-      oldLine = +m[1];
-      newLine = +m[3];
-      cur = { oldStart: oldLine, newStart: newLine, section: m[5] || '', rows: [] };
-      hunks.push(cur);
-      continue;
-    }
-    if (!cur || line === '' || line.startsWith('\\')) continue; // trailing split artifact, pre-hunk header, or "\ No newline..."
-    const c = line[0], body = line.slice(1);
-    if (c === '+') cur.rows.push({ type: 'add', newLine: newLine++, text: body });
-    else if (c === '-') cur.rows.push({ type: 'del', oldLine: oldLine++, text: body });
-    else cur.rows.push({ type: 'ctx', oldLine: oldLine++, newLine: newLine++, text: body });
-  }
-  return hunks;
-}
-
-/* ---------- unified layout: one row per diff line ---------- */
-
-function unifiedTable(hunk) {
-  const table = document.createElement('div');
-  table.className = 'diff-table diff-unified';
-  for (const row of hunk.rows) {
-    const r = document.createElement('div');
-    r.className = 'diff-row diff-' + row.type;
-    r.append(
-      lineCell(row.type === 'add' ? '' : row.oldLine),
-      lineCell(row.type === 'del' ? '' : row.newLine),
-      markerCell(row.type),
-      codeCell(row.text),
-    );
-    table.append(r);
-  }
-  return table;
-}
-
-/* ---------- split layout: deletions and additions paired side by side ---------- */
-
-function splitTable(hunk) {
-  const table = document.createElement('div');
-  table.className = 'diff-table diff-split';
-  for (const pair of pairRows(hunk.rows)) {
-    const r = document.createElement('div');
-    r.className = 'diff-row-pair';
-    r.append(splitSide(pair.left, 'left'), splitSide(pair.right, 'right'));
-    table.append(r);
-  }
-  return table;
-}
-
-// Walks a hunk's flat row list, pairing each run of deletions with the run of
-// additions that immediately follows it (a "changed" block) index-by-index,
-// padding the shorter side with blanks. Context rows go straight across.
-function pairRows(rows) {
-  const pairs = [];
-  let i = 0;
-  while (i < rows.length) {
-    const row = rows[i];
-    if (row.type === 'ctx') { pairs.push({ left: row, right: row }); i++; continue; }
-    let dels = [], adds = [];
-    while (i < rows.length && rows[i].type === 'del') dels.push(rows[i++]);
-    while (i < rows.length && rows[i].type === 'add') adds.push(rows[i++]);
-    const n = Math.max(dels.length, adds.length);
-    for (let k = 0; k < n; k++) pairs.push({ left: dels[k] || null, right: adds[k] || null });
-  }
-  return pairs;
-}
-
-function splitSide(row, side) {
-  const el = document.createElement('div');
-  el.className = 'diff-side diff-side-' + side + (row ? ' diff-' + row.type : ' diff-blank');
-  if (!row) { el.append(lineCell(''), markerCell(''), codeCell('')); return el; }
-  const ln = side === 'left' ? row.oldLine : row.newLine;
-  el.append(lineCell(ln), markerCell(row.type), codeCell(row.text));
-  return el;
-}
-
-function lineCell(n) {
-  const el = document.createElement('div');
-  el.className = 'diff-ln';
-  el.textContent = n === '' || n === undefined ? '' : String(n);
-  return el;
-}
-
-const MARKS = { add: '+', del: '-', ctx: '' };
-
-function markerCell(type) {
-  const el = document.createElement('div');
-  el.className = 'diff-mk';
-  el.textContent = MARKS[type] || '';
-  return el;
-}
-
-function codeCell(text) {
-  const el = document.createElement('div');
-  el.className = 'diff-code';
-  el.innerHTML = esc(text || '') || '&nbsp;';
-  return el;
-}
-
-function initDiff() {
-  const sw = $('#diff-switch');
-  sw.addEventListener('mousedown', e => e.preventDefault());
-  sw.addEventListener('click', e => {
-    const b = e.target.closest('[data-diff]');
-    if (!b) return;
-    // Only Split/Unified are buttons; clicking the one already active exits to source.
-    setDiffMode(b.dataset.diff === diffMode() ? 'source' : b.dataset.diff);
-  });
-}
-
 // --- File: web/src/tabs.js ---
 // web/src/tabs.js
 
@@ -3045,12 +3077,15 @@ async function openFile(path, opts = {}) {
       showImage(path);
       return;
     }
+    const hasDiff = !!j.diffAvailable;
     const d = {
       path, name: path.split('/').pop(), lang: j.lang, total: j.total, maxCols: j.maxCols,
       size: j.size, lines: new Array(j.total), chunks: new Set([start / CHUNK]),
       pending: new Set(), refining: new Set(), scrollTop: 0, cur: line || 1,
       outline: null, gen: 0, markdown: !!j.markdown, html: !!j.html || /\.(html|htm)$/i.test(path), gutter: null,
-      diffMode: null, diffAvailable: false,
+      diffMode: hasDiff ? (layoutPref() || 'split') : null,
+      diffAvailable: hasDiff,
+      diffDismissed: false,
     };
     for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
     d.lsp = j.lsp || { state: 'off', server: '' };
@@ -3061,7 +3096,7 @@ async function openFile(path, opts = {}) {
   }
   const prev = doc_();
   if (prev && prev !== S.tabs[idx]) prev.scrollTop = vp.scrollTop;
-  if (prev !== S.tabs[idx]) clearSelectAll();
+  if (prev !== S.tabs[idx]) { clearSelectAll(); clearFind(); }
   S.active = idx;
   const d = S.tabs[idx];
 
@@ -3094,6 +3129,13 @@ function loadGutter(d) {
   if (!S.meta?.git) return;
   api('/api/gutter', { path: d.path }).then(j => {
     d.diffAvailable = !!j.available;
+    if (j.available && d.diffMode === null && !d.diffDismissed) {
+      d.diffMode = layoutPref() || 'split';
+      if (doc_() === d) {
+        syncDiffView();
+        syncPreview();
+      }
+    }
     if (doc_() === d) updateStatus();
     if (!j.available) return;
     const marks = new Map();
@@ -3102,6 +3144,115 @@ function loadGutter(d) {
     d.gutter = { marks, dels: new Set(j.deleted) };
     if (doc_() === d) render();
   }).catch(() => {});
+}
+
+// Quietly re-fetches all open tabs on workspace reindex without tab-switching thrash.
+// Preserves live scroll position, cursor column/line (clamped), diff settings, and markdown scroll.
+async function reloadOpenTabs() {
+  if (S.tabs.length === 0) return;
+
+  const activeDoc = doc_();
+  if (activeDoc) {
+    activeDoc.scrollTop = vp.scrollTop;
+    if (previewing(activeDoc)) {
+      const mv = $('#mdview');
+      if (mv) activeDoc.mdScroll = mv.scrollTop;
+    }
+  }
+
+  const targets = S.tabs.map(t => ({
+    oldDoc: t,
+    path: t.path,
+    anchor: t.cur || 1,
+    start: t.cur ? Math.max(0, Math.floor((t.cur - 1) / CHUNK) * CHUNK) : 0,
+  }));
+
+  const results = await Promise.allSettled(
+    targets.map(tgt => api('/api/file', { path: tgt.path, start: tgt.start, count: CHUNK }))
+  );
+
+  for (let i = 0; i < targets.length; i++) {
+    const res = results[i];
+    const tgt = targets[i];
+    const idx = S.tabs.indexOf(tgt.oldDoc);
+    if (idx < 0) continue; // tab closed while reloading
+
+    if (res.status !== 'fulfilled') {
+      if (idx === S.active) {
+        setStatusNote(tgt.path + ': ' + (res.reason?.message || 'failed to load'));
+      }
+      continue;
+    }
+
+    const j = res.value;
+    if (j.image) continue;
+
+    const keep = tgt.oldDoc;
+    const hasDiff = !!j.diffAvailable;
+    const newCur = Math.max(1, Math.min(keep.cur || 1, j.total));
+
+    let diffMode = null;
+    if (hasDiff) {
+      if (keep.diffDismissed) {
+        diffMode = null;
+      } else if (keep.diffMode) {
+        diffMode = keep.diffMode;
+      } else {
+        diffMode = layoutPref() || 'split';
+      }
+    }
+
+    const d = {
+      path: tgt.path,
+      name: tgt.path.split('/').pop(),
+      lang: j.lang,
+      total: j.total,
+      maxCols: j.maxCols,
+      size: j.size,
+      lines: new Array(j.total),
+      chunks: new Set([tgt.start / CHUNK]),
+      pending: new Set(),
+      refining: new Set(),
+      scrollTop: keep.scrollTop || 0,
+      cur: newCur,
+      col: keep.col || 0,
+      outline: null,
+      gen: 0,
+      markdown: !!j.markdown,
+      mdScroll: keep.mdScroll || 0,
+      gutter: null,
+      diffMode,
+      diffAvailable: hasDiff,
+      diffDismissed: !!keep.diffDismissed,
+    };
+
+    for (let k = 0; k < j.lines.length; k++) {
+      d.lines[j.start + k] = j.lines[k];
+    }
+    d.lsp = j.lsp || { state: 'off', server: '' };
+
+    S.tabs[idx] = d;
+    if (j.refine) refineChunk(d, tgt.start / CHUNK);
+    loadGutter(d);
+  }
+
+  const d = doc_();
+  if (d) {
+    S.lsp.state = (d.lsp && d.lsp.state) || 'off';
+    S.lsp.server = (d.lsp && d.lsp.server) || '';
+    S.lsp.missing = (d.lsp && d.lsp.missing) || '';
+    warmLSP(d);
+    syncPreview();
+    syncDiffView();
+    layout();
+    vp.scrollTop = d.scrollTop;
+    render();
+    if ($('#panel-outline')?.classList.contains('active')) loadOutline();
+  }
+
+  drawTabs();
+  drawCrumbs();
+  updateStatus();
 }
 
 function centerLine(n) {
@@ -3311,7 +3462,6 @@ function initTheme() {
 
 
 
-
 /* Each entry lists alternative combos, written as for keyLabel in state.js so
    they show as ⌘/⌥/⇧ on a Mac and Ctrl/Alt/Shift elsewhere. Browsers keep
    Ctrl+W and Cmd+W for themselves, so Alt+W is the close shortcut shown. */
@@ -3359,7 +3509,7 @@ function initShortcuts() {
     if (!btn) return;
     const act = btn.dataset.action;
     if (act === 'quick-open') openPalette('file');
-    else if (act === 'search') { showPanel('search'); $('#q')?.select(); }
+    else if (act === 'search') { showRightInspector('search'); $('#q')?.select(); }
     else if (act === 'symbols') openPalette('symbol');
     else if (act === 'find') openFind(S.lastWord);
     else if (act === 'goto') openPalette('line');
@@ -3401,7 +3551,7 @@ function initShortcuts() {
 
     if (mod && e.shiftKey && (e.key === 'P' || e.key === 'p')) { e.preventDefault(); openPalette('command'); return; }
     if (mod && e.shiftKey && (e.key === 'O' || e.key === 'o')) { e.preventDefault(); showRightInspector('symbols'); return; }
-    if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) { e.preventDefault(); showPanel('search'); $('#q')?.select(); return; }
+    if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) { e.preventDefault(); showRightInspector('search'); $('#q')?.select(); return; }
     if (mod && !e.shiftKey && (e.key === 'p' || e.key === 'P')) { e.preventDefault(); openPalette('file'); return; }
     if (mod && (e.key === 'g' || e.key === 'G')) { e.preventDefault(); openPalette('line'); return; }
     if (mod && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); openFind(S.lastWord); return; }
@@ -3502,7 +3652,7 @@ const COMMANDS = [
   { name: 'Go to File…', run: () => openPalette('file') },
   { name: 'Go to Symbol in File…', run: () => openPalette('symbol') },
   { name: 'Go to Line…', run: () => openPalette('line') },
-  { name: 'Search in Files', run: () => showPanel('search') },
+  { name: 'Search in Files', run: () => showRightInspector('search') },
   { name: 'Find in Current File', run: () => openFind(S.lastWord) },
   { name: 'Go to Definition', run: () => gotoDefinition() },
   { name: 'Find All References (Right Panel)', run: () => findReferences() },
@@ -3741,6 +3891,22 @@ initStatusFit();
   }
   updateStatus();
   await drawTree('', treeEl, 0);
+
+  const params = new URLSearchParams(window.location.search);
+  const initialPath = params.get('path');
+  const initialLine = parseInt(params.get('line'), 10) || undefined;
+  if (initialPath) {
+    await openFile(initialPath, { line: initialLine });
+    await revealFile(initialPath);
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.delete('path');
+      u.searchParams.delete('line');
+      const cleanSearch = u.searchParams.toString();
+      const cleanUrl = u.pathname + (cleanSearch ? '?' + cleanSearch : '') + u.hash;
+      window.history.replaceState({}, '', cleanUrl);
+    } catch {}
+  }
 
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(() => { measure(); layout(); render(); });

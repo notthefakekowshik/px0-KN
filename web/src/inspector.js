@@ -26,10 +26,12 @@ export function setRightInspectorTab(tab) {
   $('#pane-right-refs')?.classList.toggle('active', tab === 'refs');
   $('#pane-right-symbols')?.classList.toggle('active', tab === 'symbols');
   $('#pane-right-calls')?.classList.toggle('active', tab === 'calls');
+  $('#pane-right-search')?.classList.toggle('active', tab === 'search');
   if (tab === 'symbols') {
     loadOutline();
     $('#right-symbols-filter')?.focus();
   }
+  if (tab === 'search') $('#q')?.focus();
 }
 
 export function renderRightResults(word, hits, server, isExact) {

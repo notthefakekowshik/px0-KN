@@ -8,7 +8,6 @@ import { go } from './history.js';
 import { clearLink, hovercard } from './hover.js';
 import { openFind, clearFind, findbar } from './find.js';
 import { gotoDefinition, findReferences } from './lsp.js';
-import { showPanel } from './panels.js';
 import { showRightInspector, hideRightInspector } from './inspector.js';
 import { overlay, openPalette, closePalette } from './palette.js';
 import { moveCursor, moveCol, caretToEdge } from './cursor.js';
@@ -67,7 +66,7 @@ export function initShortcuts() {
     if (!btn) return;
     const act = btn.dataset.action;
     if (act === 'quick-open') openPalette('file');
-    else if (act === 'search') { showPanel('search'); $('#q')?.select(); }
+    else if (act === 'search') { showRightInspector('search'); $('#q')?.select(); }
     else if (act === 'symbols') openPalette('symbol');
     else if (act === 'find') openFind(S.lastWord);
     else if (act === 'goto') openPalette('line');
@@ -109,7 +108,7 @@ export function initShortcuts() {
 
     if (mod && e.shiftKey && (e.key === 'P' || e.key === 'p')) { e.preventDefault(); openPalette('command'); return; }
     if (mod && e.shiftKey && (e.key === 'O' || e.key === 'o')) { e.preventDefault(); showRightInspector('symbols'); return; }
-    if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) { e.preventDefault(); showPanel('search'); $('#q')?.select(); return; }
+    if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) { e.preventDefault(); showRightInspector('search'); $('#q')?.select(); return; }
     if (mod && !e.shiftKey && (e.key === 'p' || e.key === 'P')) { e.preventDefault(); openPalette('file'); return; }
     if (mod && (e.key === 'g' || e.key === 'G')) { e.preventDefault(); openPalette('line'); return; }
     if (mod && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); openFind(S.lastWord); return; }

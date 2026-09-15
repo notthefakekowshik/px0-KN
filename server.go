@@ -450,7 +450,7 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	from := r.URL.Query().Get("from")
 	target := r.URL.Query().Get("target")
-	res := resolveTarget(s.ix, from, target)
+	res := resolveImportTarget(s.ix, from, target)
 	writeJSON(w, res)
 }
 
@@ -494,13 +494,18 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	lines, exact := d.Lines(start, start+count)
 	_, coming := d.Exact()
+	diffAvail := false
+	if gitAvailable(s.ix.Root()) {
+		diffAvail = gitDiff(s.ix.Root(), rel) != ""
+	}
 	writeJSON(w, map[string]any{
 		"path": rel, "lang": d.Lang, "total": d.Total, "maxCols": d.MaxCols,
 		"start": start, "lines": lines, "size": st.Size(),
 		"exact": exact, "refine": !exact && coming,
-		"markdown": isMarkdown(rel),
-		"html":     isHTML(rel),
-		"lsp":      s.lspBrief(rel),
+		"markdown":      isMarkdown(rel),
+		"html":          isHTML(rel),
+		"diffAvailable": diffAvail,
+		"lsp":           s.lspBrief(rel),
 	})
 }
 

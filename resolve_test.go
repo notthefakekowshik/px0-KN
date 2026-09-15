@@ -27,7 +27,7 @@ func TestHasFile(t *testing.T) {
 	}
 }
 
-func TestResolveTarget(t *testing.T) {
+func TestResolveImportTarget(t *testing.T) {
 	ix := NewIndex("/workspace")
 	ix.files = []FileEntry{
 		{Path: "README.md", Name: "README.md"},
@@ -122,9 +122,9 @@ func TestResolveTarget(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			res := resolveTarget(ix, tc.from, tc.target)
+			res := resolveImportTarget(ix, tc.from, tc.target)
 			if res.Found != tc.wantOK {
-				t.Fatalf("resolveTarget(%q, %q) found = %v, want %v", tc.from, tc.target, res.Found, tc.wantOK)
+				t.Fatalf("resolveImportTarget(%q, %q) found = %v, want %v", tc.from, tc.target, res.Found, tc.wantOK)
 			}
 			if tc.wantOK {
 				if res.Path != tc.wantPath {
@@ -138,7 +138,7 @@ func TestResolveTarget(t *testing.T) {
 	}
 }
 
-func BenchmarkResolveTarget(b *testing.B) {
+func BenchmarkResolveImportTarget(b *testing.B) {
 	ix := &Index{
 		files: []FileEntry{
 			{Path: "README.md", Name: "README.md"},
@@ -150,6 +150,6 @@ func BenchmarkResolveTarget(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = resolveTarget(ix, "web/src/cursor.js", "./state")
+		_ = resolveImportTarget(ix, "web/src/cursor.js", "./state")
 	}
 }

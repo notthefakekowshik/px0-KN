@@ -1,31 +1,31 @@
-# px0: Read Code. Fast.
+# px0
 
-px0 is a fast, lightweight, read-only IDE designed for instant code navigation and review in your browser. Booting in under 1 ms and using ~20 MB of RAM, it turns your browser into a zero-latency inspection console with symbol-level navigation, deep search, and syntax highlighting across massive codebases.
+px0 is a fast, ultra-light, remote-first, read-only IDE designed for instant code navigation and review in your browser. Booting in under 1 ms and using ~20 MB of RAM, it turns your browser into a zero-latency inspection console with symbol-level navigation, deep search, and syntax highlighting across massive codebases.
 
-## Why a Read-Only IDE?
+## Optimized for Reads
 
-More and more, code generation happens directly in the terminal, driven by coding agents, CLI tools, and background orchestrators. We spend less time hand-typing boilerplate inside heavy, sluggish editors that consume gigabytes of memory and take seconds to boot.
+More and more code generation happens directly in the terminal—driven by coding agents, CLI tools, and background orchestrators. Developers spend significantly less time typing boilerplate and more time reviewing, auditing, and navigating.
 
-Instead, the developer's role is shifting toward review, navigation, and audit:
+Because speed of access is everything when inspecting code, **px0 is obsessively optimized for reads—and is strictly read-only at the moment.** You don't need a heavy editing environment with background extension churn just to verify code; you need a sub-millisecond, zero-latency window into the repository, especially across remote machines.
 
-- Terminals drive generation: Tools generate the code, execute tests, and manage workflows.
-- Developers drive verification: We need to quickly inspect diffs, verify symbol references, trace definitions, and sanity-check architecture.
-- Desktop IDEs are overkill for review: Launching a massive Electron app or heavy IDE suite just to inspect generated code wastes time and system resources.
+### Where px0 fits in best:
 
-When you're reviewing code, you don't need a heavy editing environment, you need an instant, zero-latency window into your codebase. px0 is built for this: sub-millisecond startup, deep code intelligence, and instant search with virtually zero footprint.
+- **Verifying AI Agent Output**: Trace symbol references, inspect live git diffs against `HEAD`, review generated code, and close the tab without leaving your terminal flow.
+- **Remote & Cloud Server Inspection**: Spin up on any remote server, VM, or CI runner and browse the codebase instantly from your local browser—no SSH keys, no port forwarding hassle, and no heavy remote desktop/daemons.
+- **Auditing Large Repositories**: Read through massive, 50,000+ file codebases on a laptop without background indexers hogging RAM or spinning up fans.
+- **Sidecar to Terminal Editors**: Keep lightweight editors (like Vim, Neovim, or Helix) in the terminal for typing, while using px0 as a high-density, rich graphical inspection and diff console.
 
 ## Installation
-### Option 1: Quick Install (macOS, Linux, BSD)
 
-Install or upgrade to the latest release with a single command:
+### Quick Install (macOS, Linux, BSD)
 
 ```bash
 curl -fsSL https://px0.ai/install.sh | sh
 ```
 
-### Option 2: Build from Source
+### Build from Source
 
-Requires Go 1.24 or newer. No npm, no node, no CGO, and no system libraries required:
+Requires Go 1.24+. No npm, node, CGO, or external dependencies:
 
 ```bash
 git clone https://github.com/px0-ai/px0.git
@@ -34,63 +34,59 @@ make build
 install -d ~/.local/bin && install px0 ~/.local/bin/
 ```
 
-To cross-compile binaries for all 15 supported OS and architecture combinations:
+To cross-compile binaries for all supported platforms:
 
 ```bash
 make dist
-# or ./build.sh
 ```
 
 ## Features
 
-- Blazing Fast Code Navigation: Fuzzy search files (`Cmd/Ctrl+P`), document symbols (`Cmd/Ctrl+Shift+O`), and full project regex scan (`Cmd/Ctrl+Shift+F`) in milliseconds.
-- Rich Syntax Highlighting: Built-in native tokenization for ~280 languages via Chroma.
-- Custom Themes: Ships 14 built-in themes, including Tokyo Night (default), Paper, Catppuccin, Dracula, GitHub Dark, Gruvbox, Monokai, Nord, One Dark, Rose Pine, and Solarized. Switch via the button at the bottom of the sidebar or `Select Theme` in the command palette. See [Styling & Themes](docs/internals/styling-and-themes.md) to write your own.
-- Optional Language Server Protocol (LSP): Zero-config auto-detection of local LSPs (`gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`, etc.) for precise Go-to-Definition (`F12`), Hover info, and cross-references. Falls back automatically to instant regex outlines when no LSP is installed.
-- Git Awareness: In a git repository, the file tree badges each file by its status (`M` modified, `A` added, `D` deleted, `U` untracked, `R` renamed), colouring changes green (added) or red (deleted/modified) and marking folders that contain changes. A changed only filter hides clean files, and a modified file gets Split/Unified buttons next to the tab bar (or `Cmd/Ctrl+D`) that open its diff against `HEAD` — side by side by default, or as a single unified column, each with old/new line numbers. Read-only like everything else, and disabled with `-no-git` or when no git is present.
-- Virtual DOM / Zero Overhead: Opening a 400,000-line file costs the same as a 10-line file; only visible lines render in the browser.
-- Clean Terminal Experience: CLI adheres to the Ape design spec with a subtle 256-color palette, Unix pipe detection, and quiet automation modes.
-- Completely Self-Contained: Single static binary embedding HTML, CSS, and JS. Zero runtime dependencies, no electron, and no cloud phone-homes.
+- **Blazing Fast Navigation**: Fuzzy file search (`Cmd/Ctrl+P`), symbol outline (`Cmd/Ctrl+Shift+O`), and workspace regex search (`Cmd/Ctrl+Shift+F`) in milliseconds.
+- **Remote-First, Zero SSH Hassle**: Spin up on any remote server, cloud instance, or runner in < 1 ms. Inspect remote code in your local browser over a single port (Tailscale, WireGuard, reverse proxy, or tunnel) without SSH key setups, port forwarding churn, or remote extension daemons.
+- **Rich Syntax Highlighting**: Native tokenization for ~280 languages via Chroma with windowed rendering.
+- **Git Awareness & Visual Diffs**: Status badges (`M`, `A`, `D`, `U`, `R`), dirty folder ancestry propagation, changed-files filter, and side-by-side / unified diffs vs `HEAD` (`Cmd/Ctrl+D`).
+- **Rendered Markdown Preview**: Full GFM preview with Chroma-highlighted code fences; switch between preview and source with `Alt+M` while preserving scroll.
+- **Custom Themes**: 14 built-in themes (Tokyo Night, Catppuccin, Dracula, GitHub Dark, Gruvbox, Nord, Solarized, and more).
+- **Optional Language Server Protocol (LSP)**: Zero-config auto-detection (`gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`) for Go-to-Definition (`F12`), Hover, references, and call trails. Falls back automatically to regex outlines.
+- **Virtual DOM / Zero Overhead**: Opening a 400,000-line file costs the same as a 10-line file; only visible rows are mounted. Reclaims memory after 15 seconds of inactivity.
+- **Completely Self-Contained**: Single static binary embedding all web assets. Zero runtime dependencies, no Electron, no Node, no cloud phone-homes.
 
 ## Language Server (LSP) Setup (Optional)
 
-`px0` works entirely out of the box without any language servers: fuzzy file search, project grep, and outline parsing are completely built-in.
+`px0` works fully out of the box without language servers using built-in fuzzy search and regex outlines.
 
-However, having language servers installed gives `px0` superpowers: semantic Go-to-Definition (`F12`), type hover docs, and jump-to-definition into standard library files. px0 does not ship any language server. It detects the ones below if they are on your `PATH` or in the usual install folders (`~/go/bin`, `~/.cargo/bin`, `~/.local/bin`, npm's global folder, and Homebrew's folders on macOS). Where a language has several, the first one found in the order listed is used:
+When installed, language servers provide semantic Go-to-Definition (`F12`), hover types/docs, and call trails. px0 auto-detects servers on your `PATH` or standard install directories:
 
-| Language                  | Server                       | Quick Install Command                                                                                     |
-| ------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------- |
-| Go                        | `gopls`                      | `go install golang.org/x/tools/gopls@latest`                                                              |
-| Rust                      | `rust-analyzer`              | `rustup component add rust-analyzer`                                                                      |
-| TypeScript / JavaScript   | `typescript-language-server` | `npm install -g typescript-language-server typescript`                                                    |
-| Python                    | `pyright`, `pylsp` or `ruff` | `npm install -g pyright` or `pipx install python-lsp-server`. `ruff` (`pip install ruff`) is detected too, but gives no call trails |
-| C / C++                   | `clangd`                     | `sudo apt install clangd` or `brew install llvm`                                                          |
-| Zig                       | `zls`                        | `brew install zls` or download from [zigtools/zls](https://github.com/zigtools/zls)                       |
-| Lua                       | `lua-language-server`        | `brew install lua-language-server` (macOS)                                                                |
-| Ruby                      | `solargraph`                 | `gem install solargraph`                                                                                  |
-| Java                      | `jdtls`                      | `brew install jdtls` (macOS)                                                                              |
-| C#                        | `omnisharp`                  | Install OmniSharp and put `omnisharp` on `PATH`                                                           |
-| LaTeX                     | `texlab`                     | `brew install texlab` (macOS)                                                                             |
+| Language | Server | Quick Install |
+| --- | --- | --- |
+| Go | `gopls` | `go install golang.org/x/tools/gopls@latest` |
+| Rust | `rust-analyzer` | `rustup component add rust-analyzer` |
+| TypeScript / JavaScript | `typescript-language-server` | `npm install -g typescript-language-server typescript` |
+| Python | `pyright` / `pylsp` / `ruff` | `npm install -g pyright` or `pipx install python-lsp-server` |
+| C / C++ | `clangd` | `sudo apt install clangd` or `brew install llvm` |
+| Zig | `zls` | `brew install zls` or [zigtools/zls](https://github.com/zigtools/zls) |
+| Lua | `lua-language-server` | `brew install lua-language-server` |
+| Ruby | `solargraph` | `gem install solargraph` |
+| Java | `jdtls` | `brew install jdtls` |
+| C# | `omnisharp` | Install OmniSharp on `PATH` |
+| LaTeX | `texlab` | `brew install texlab` |
 
-Servers are spawned lazily on first request for that file type and shut down cleanly upon exit. You can also disable LSP detection entirely at any time using `px0 -no-lsp`.
-
-No server for the file you are reading? The status bar shows LSP: set up. Click it, open the Calls tab, or run `Set Up Language Server...` from the command palette to see the install options for your OS. px0 runs user-level installers (`go`, `rustup`, `npm`, `pipx`, `gem`, `brew`) for you on request, finds the result in the usual install folders even when they are not on `PATH`, and starts the server without a restart. Installers that need an administrator (`sudo apt`, `winget`) are shown for you to copy and run. px0 has no installer for `zls`, `lua-language-server`, `jdtls` or `texlab` outside macOS, or for `omnisharp` and `ruff` anywhere: install those yourself, then click Detect and start. Installing only works from px0's own page opened by IP address or `localhost`.
+Servers spawn lazily on first request and shut down cleanly upon exit. Disable with `px0 -no-lsp`. You can also click **LSP: set up** in the status bar to view or trigger automatic installation for your OS.
 
 ## Why a Dedicated Code Viewer?
 
-Traditional IDEs (like VS Code and JetBrains) were architected when developers spent almost all their time manually typing code. They carry tens of thousands of editing features, bloated Electron/Node runtimes, complex file watchers, heavy background extensions, and gigabytes of memory overhead.
+Traditional IDEs carry tens of thousands of authoring features, Electron runtimes, background indexers, and gigabytes of memory overhead. In modern AI-assisted workflows, developers spend significantly more time reviewing code than typing it.
 
-In the modern development workflow, with AI coding agents, fast branch reviews, pull requests, and automated generation, developers spend significantly more time inspecting, reviewing, navigating, and understanding codebases than typing boilerplate.
-
-| Parameter                | Traditional IDE (such as VS Code)     | px0 (Code Viewer)                  |
-| ------------------------ | ------------------------------------- | ---------------------------------- |
-| Primary Purpose          | Manual code authoring and plugin host | Instant code reading & navigation  |
-| Base Memory (RSS)        | ~1,440 MB (1.4+ GB)                   | ~20 MB (~70x lighter)              |
-| Active Startup CPU Spike | 35% - 50%                             | < 1%                               |
-| Cold Startup Time        | Several seconds                       | Sub-millisecond                    |
-| Process Tree             | 15+ Node.js/Electron processes        | 1 single static Go binary          |
-| Workspace Indexing       | Multi-second background churn         | 0 - 45 ms for entire repositories  |
-| Setup and Config         | Config files, plugins, node, npm      | Zero config, zero runtime          |
+| Parameter | Traditional IDE (e.g., VS Code) | px0 (Code Viewer) |
+| --- | --- | --- |
+| Primary Purpose | Manual code authoring & plugin host | Instant code reading & navigation |
+| Base Memory (RSS) | ~1,440 MB (1.4+ GB) | ~20 MB (~70x lighter) |
+| Active Startup CPU Spike | 35% - 50% | < 1% |
+| Cold Startup Time | Several seconds | Sub-millisecond |
+| Process Tree | 15+ Node.js/Electron processes | 1 single static Go binary |
+| Workspace Indexing | Multi-second background churn | 0 - 45 ms for entire repositories |
+| Setup and Config | Config files, plugins, node, npm | Zero config, zero runtime |
 
 ## Key Numbers and Benchmarks
 
@@ -125,14 +121,31 @@ Run `./benchmark.sh --vscode .` to measure both on your active machine:
 
 ## Usage
 
-Run `px0` pointing to any directory:
+Run `px0` with an optional file or directory:
 
 ```bash
-px0                 # view the current workspace
-px0 ~/src/kernel    # view another repository
+px0                     # view current workspace
+px0 ~/src/kernel        # view another repository
+px0 web/src/main.js     # view a file in its project workspace
+px0 main.go:42          # open directly to a line number
 ```
 
-`px0` starts the local viewer, prints the URL, and opens your default browser immediately.
+### Remote & Cloud Workspaces
+
+Spin up on any remote server, VM, or container and view code directly in your local browser without SSH shell management, X11 forwarding, or remote extension daemons:
+
+```bash
+# Bind all interfaces on a remote machine / cloud instance
+px0 -host 0.0.0.0 -port 7777 ~/work/repo
+
+# Headless / server mode without opening local browser
+px0 -no-open -port 8080 /workspace
+
+# In Docker / CI runner
+docker run -p 7777:7777 -v $(pwd):/src px0:latest
+```
+
+Access securely over Tailscale, WireGuard, reverse proxy, or Cloudflare Tunnel with zero remote setup overhead and strict read-only sandboxing (path traversal protection & DNS rebinding checks).
 
 ### Updating px0
 
@@ -190,9 +203,10 @@ px0 --update
 
 ## Philosophy and Design Principles
 
-- Read-Only by Design: px0 does not attempt to be a code editor. Code authoring belongs to AI agents, CLI tools, or dedicated editors. px0 focuses exclusively on the reader experience.
-- Local and Private: Runs locally on `127.0.0.1` with zero accounts. Code, file paths, and symbol queries never leave your machine.
-- Ape Terminal & Web Aesthetics: Minimal, quiet, high information density, designed for pair-programming and flow state.
+- **Optimized for Reads**: px0 does not attempt to be a heavy code editor. Code authoring belongs to AI agents, CLI tools, or dedicated editors. px0 focuses exclusively on the reader experience with zero write endpoints.
+- **Remote-First & SSH-Free**: Works seamlessly whether inspecting a local directory or a cloud instance over Tailscale/VPN—no remote daemons, no X11 forwarding, and no SSH session maintenance.
+- **Private & Sandboxed**: Zero accounts, zero cloud dependencies. Code and queries stay on the running machine. Protected by path traversal guards and DNS rebinding prevention.
+- **Reclaims Memory**: Automatically recovers memory after 15 seconds of inactivity so idle sessions don't hoard host RAM.
 
 ### Telemetry & Privacy
 

@@ -17,7 +17,7 @@ import { initShortcuts } from './shortcuts.js';
 import { initTheme } from './theme.js';
 import { initMarkdown } from './markdown.js';
 import { initDiff } from './diff.js';
-import { updateStatus, initMetrics, initStatusFit, updateMetricsDisplay } from './status.js';
+import { updateStatus, initMetrics, initStatusFit, initStatus, updateMetricsDisplay } from './status.js';
 
 // Initialize all subsystems
 initRenderer();
@@ -37,6 +37,7 @@ initShortcuts();
 initMarkdown();
 initDiff();
 initMetrics();
+initStatus();
 initStatusFit();
 
 // Bootstrap application lifecycle

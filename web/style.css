@@ -562,8 +562,26 @@ kbd {
 #status.fit-2 #st-index, #status.fit-2 #st-size,
 #status.fit-3 .metric-label,
 #status.fit-4 [data-action="wrap"], #status.fit-4 [data-action="line-numbers"], #status.fit-4 [data-action="help"], #status.fit-4 .sel-chip, #status.fit-4 #sel-stats,
-#status.fit-5 #st-metrics,
+#status.fit-5 #st-metrics, #status.fit-5 .status-path,
 #status.fit-6 #st-lsp { display: none; }
+#status.fit-2 .status-path { max-width: 220px; }
+#status.fit-3 .status-path { max-width: 140px; }
+.status-path {
+  color: var(--fg);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  padding: 1px 4px;
+  margin: 0 -4px;
+  border-radius: 3px;
+  transition: background .12s, color .12s;
+}
+.status-path:hover {
+  background: var(--bg4);
+  color: var(--accent-fg);
+}
 #footer-actions { display: flex; align-items: center; gap: 3px; }
 .footer-btn {
   display: inline-flex; align-items: center; gap: 4px;
@@ -600,6 +618,7 @@ kbd {
 #status.selecting #footer-sel { display: flex; animation: sel-in .12s ease-out; }
 #status.selecting > #footer-actions,
 #status.selecting > #footer-actions + .status-sep,
+#status.selecting > #st-path,
 #status.selecting > #st-size { display: none; }
 @keyframes sel-in { from { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { #status.selecting #footer-sel { animation: none; } }

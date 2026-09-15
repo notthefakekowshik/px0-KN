@@ -45,7 +45,7 @@ export const runFind = debounce(async () => {
   const d = doc_(); if (!d) return;
   const q = findInput.value;
   // The Markdown preview is searched as rendered text, in the page itself.
-  if (previewing(d)) {
+  if (d.markdown && previewing(d)) {
     const n = findInPreview(q);
     S.find = q ? { q, ci: false, hits: new Array(n).fill(null), byLine: new Set(), active: n ? 0 : -1, preview: true } : null;
     $('#find-count').textContent = !q ? '0' : n ? '1 / ' + n : 'no results';

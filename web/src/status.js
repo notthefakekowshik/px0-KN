@@ -13,17 +13,17 @@ export function updateStatus() {
   const sizeEl = $('#st-size');
   if (sizeEl) sizeEl.textContent = d ? fmtBytes(d.size) : '';
 
-  const isMd = !!(d && d.markdown), shown = previewing(d);
+  const isPreviewable = !!(d && (d.markdown || d.html)), shown = previewing(d);
   const mdBtn = $('[data-action="md-preview"]');
   if (mdBtn) {
-    mdBtn.hidden = !isMd;
+    mdBtn.hidden = !isPreviewable;
     mdBtn.classList.toggle('active', shown);
   }
   const sw = $('#md-switch');
   if (sw) {
-    sw.hidden = !isMd;
-    document.body.classList.toggle('md-tab', isMd);
-    for (const b of sw.children) b.classList.toggle('on', isMd && (b.dataset.md === 'preview') === shown);
+    sw.hidden = !isPreviewable;
+    document.body.classList.toggle('md-tab', isPreviewable);
+    for (const b of sw.children) b.classList.toggle('on', isPreviewable && (b.dataset.md === 'preview') === shown);
   }
 
   const hasDiff = !!(d && d.diffAvailable), mode = (d && d.diffMode) || 'source';

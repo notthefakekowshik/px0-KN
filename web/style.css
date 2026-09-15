@@ -440,8 +440,9 @@ body.hide-lines .c { padding-left: 16px; }
 .diff-side { flex: 1 1 50%; min-width: 0; }
 .diff-side-left { border-right: 1px solid var(--line); }
 
-/* ---------- markdown preview ---------- */
+/* ---------- markdown & html preview ---------- */
 #mdview { position: absolute; inset: 0; overflow: auto; background: var(--bg); }
+#htmlview { position: absolute; inset: 0; width: 100%; height: 100%; border: none; background: var(--bg); color-scheme: light dark; }
 .md {
   max-width: 860px; margin: 0 auto; padding: 40px clamp(20px, 6%, 56px) 40vh;
   font: 15px/1.7 var(--ui); color: var(--fg); overflow-wrap: break-word;

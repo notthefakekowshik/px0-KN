@@ -38,7 +38,7 @@ export async function openFile(path, opts = {}) {
       path, name: path.split('/').pop(), lang: j.lang, total: j.total, maxCols: j.maxCols,
       size: j.size, lines: new Array(j.total), chunks: new Set([start / CHUNK]),
       pending: new Set(), refining: new Set(), scrollTop: 0, cur: line || 1,
-      outline: null, gen: 0, markdown: !!j.markdown, gutter: null,
+      outline: null, gen: 0, markdown: !!j.markdown, html: !!j.html || /\.(html|htm)$/i.test(path), gutter: null,
       diffMode: null, diffAvailable: false,
     };
     for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];

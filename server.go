@@ -60,6 +60,7 @@ func NewServer(ix *Index, lsp *lspManager) *Server {
 	s.mux.HandleFunc("/api/resolve", s.handleResolve)
 	s.mux.HandleFunc("/api/file", s.handleFile)
 	s.mux.HandleFunc("/api/close", s.handleClose)
+	s.mux.HandleFunc("/api/raw/", s.handleRaw)
 	s.mux.HandleFunc("/api/raw", s.handleRaw)
 	s.mux.HandleFunc("/api/markdown", s.handleMarkdown)
 	s.mux.HandleFunc("/api/diff", s.handleDiff)
@@ -498,8 +499,17 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		"start": start, "lines": lines, "size": st.Size(),
 		"exact": exact, "refine": !exact && coming,
 		"markdown": isMarkdown(rel),
+		"html":     isHTML(rel),
 		"lsp":      s.lspBrief(rel),
 	})
+}
+
+func isHTML(rel string) bool {
+	switch strings.ToLower(filepath.Ext(rel)) {
+	case ".html", ".htm":
+		return true
+	}
+	return false
 }
 
 func (s *Server) handleClose(w http.ResponseWriter, r *http.Request) {
@@ -516,7 +526,11 @@ func (s *Server) handleClose(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request) {
-	abs, rel, ok := s.safePath(r.URL.Query().Get("path"))
+	rawPath := r.URL.Query().Get("path")
+	if rawPath == "" {
+		rawPath = strings.TrimPrefix(r.URL.Path, "/api/raw/")
+	}
+	abs, rel, ok := s.safePath(rawPath)
 	if !ok {
 		fail(w, 400, "bad path")
 		return

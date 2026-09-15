@@ -255,3 +255,12 @@ Hover cards, Ctrl+click definitions and the selection bar listen on `#viewport`.
 - `TestHeadingIDsFollowGitHub` checks the id rules and deduplication.
 
 The sanitizer, link routing, position sync and switch run only in a browser and have no automated test in the repository.
+
+## 12. HTML Preview Support
+
+HTML files (`.html` and `.htm`) share the same preview workflow:
+- The server identifies them via `html: isHTML(rel)` on `/api/file`.
+- When opened, they default to rendered view via `#htmlview`, a sandboxed iframe (`sandbox="allow-same-origin"`).
+- The sandboxed iframe preserves complete CSS layout, typography, SVGs, and styles while preventing arbitrary JavaScript execution.
+- Relative assets and stylesheets resolve cleanly via the `/api/raw/<relpath>` route.
+- Readers can toggle between the rendered view and raw syntax-highlighted source with the Preview / Source switch, status bar Preview button, or `Alt+M`.

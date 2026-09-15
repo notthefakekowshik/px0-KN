@@ -37,7 +37,7 @@ export const COMMANDS = [
   { name: 'Reveal Active File in Explorer', run: () => { const d = doc_(); if (d) { showPanel('files'); revealFile(d.path); } } },
   { name: withKeys('Toggle Word Wrap ({Alt+Z})'), run: () => toggleWordWrap() },
   { name: withKeys('Toggle Line Numbers ({Alt+L})'), run: () => toggleLineNumbers() },
-  { name: withKeys('Toggle Markdown Preview ({Alt+M})'), run: () => togglePreview() },
+  { name: withKeys('Toggle Preview ({Alt+M})'), run: () => togglePreview() },
   { name: withKeys('Toggle Sidebar ({Mod+B})'), run: () => document.body.classList.toggle('side-hidden') },
   { name: 'Select Theme…', run: () => openPalette('theme') },
   { name: 'Next Theme', run: cycleTheme },

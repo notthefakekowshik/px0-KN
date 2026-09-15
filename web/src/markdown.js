@@ -18,26 +18,52 @@ import { hideHover } from './hover.js';
 
 export const mdview = $('#mdview');
 const mdArticle = $('#md');
+export const htmlview = $('#htmlview');
 
 let mdShown = null;  // doc the preview is showing, null while it is hidden
 let mdDrawn = null;  // doc whose HTML is in the article; drawing can wait on a fetch
 let mdGen = 0;
 
 export function previewing(d = doc_()) {
-  return !!(d && d.markdown && S.mdPreview && !d.mdError && !d.diffMode);
+  if (!d || d.mdError || d.diffMode) return false;
+  if (d.markdown) return !!S.mdPreview;
+  if (d.html) return !!S.htmlPreview;
+  return false;
 }
 
 /* Show or hide the preview to match the active tab. Call whenever that changes. */
 export function syncPreview() {
   const d = doc_();
-  const want = previewing(d) ? d : null;
-  if (want === mdShown) return;
-  if (mdShown && mdDrawn === mdShown) mdShown.mdScroll = mdview.scrollTop;
-  mdShown = want;
-  mdDrawn = null;
-  mdview.hidden = !want;
-  mdArticle.replaceChildren();
-  if (want) drawPreview(want);
+  const isPrev = previewing(d);
+  if (!isPrev) {
+    mdview.hidden = true;
+    if (htmlview) htmlview.hidden = true;
+    mdShown = null;
+    mdDrawn = null;
+    return;
+  }
+  if (d.markdown) {
+    if (htmlview) htmlview.hidden = true;
+    if (d === mdShown) return;
+    if (mdShown && mdDrawn === mdShown) mdShown.mdScroll = mdview.scrollTop;
+    mdShown = d;
+    mdDrawn = null;
+    mdview.hidden = false;
+    mdArticle.replaceChildren();
+    drawPreview(d);
+  } else if (d.html) {
+    mdview.hidden = true;
+    mdShown = null;
+    mdDrawn = null;
+    if (htmlview) {
+      htmlview.hidden = false;
+      const targetSrc = '/api/raw/' + encodeURI(d.path);
+      if (htmlview.dataset.path !== d.path) {
+        htmlview.dataset.path = d.path;
+        htmlview.src = targetSrc;
+      }
+    }
+  }
 }
 
 async function drawPreview(d) {
@@ -73,18 +99,28 @@ async function drawPreview(d) {
 
 export function togglePreview() {
   const d = doc_();
-  if (!d || !d.markdown) { showToast('!', 'Preview works on Markdown files'); return; }
+  if (!d || (!d.markdown && !d.html)) { showToast('!', 'Preview works on Markdown and HTML files'); return; }
   hideHover();
   if (previewing(d)) {
-    const line = mdDrawn === d ? previewTopLine() : 1;
-    mdSetPref(false);
-    syncPreview();
-    sourceToLine(line);
+    if (d.markdown) {
+      const line = mdDrawn === d ? previewTopLine() : 1;
+      mdSetPref(false);
+      syncPreview();
+      sourceToLine(line);
+    } else {
+      htmlSetPref(false);
+      syncPreview();
+    }
   } else {
     d.mdError = '';
-    d.mdLine = sourceTopLine();
-    mdSetPref(true);
-    syncPreview();
+    if (d.markdown) {
+      d.mdLine = sourceTopLine();
+      mdSetPref(true);
+      syncPreview();
+    } else {
+      htmlSetPref(true);
+      syncPreview();
+    }
   }
   if (!findbar.hidden) runFind(); else S.find = null;
   render();
@@ -94,6 +130,11 @@ export function togglePreview() {
 function mdSetPref(on) {
   S.mdPreview = on;
   try { localStorage.setItem('px0.mdPreview', on ? 'true' : 'false'); } catch {}
+}
+
+function htmlSetPref(on) {
+  S.htmlPreview = on;
+  try { localStorage.setItem('px0.htmlPreview', on ? 'true' : 'false'); } catch {}
 }
 
 /* ---------- sanitising ---------- */
@@ -415,5 +456,16 @@ export function initMarkdown() {
     if (!a || e.button !== 0 || e[MOD] || e.shiftKey) return;
     if ('path' in a.dataset) { e.preventDefault(); mdFollow(a.dataset.path, a.dataset.anchor || ''); }
     else if ('anchor' in a.dataset) { e.preventDefault(); mdJump(a.dataset.anchor); }
+  });
+
+  htmlview?.addEventListener('load', () => {
+    try {
+      htmlview.contentWindow.addEventListener('keydown', e => {
+        const mod = e[MOD];
+        if (e.key === 'Escape' || (e.altKey && !mod && !e.shiftKey && e.code === 'KeyM')) {
+          window.dispatchEvent(new KeyboardEvent('keydown', e));
+        }
+      });
+    } catch {}
   });
 }

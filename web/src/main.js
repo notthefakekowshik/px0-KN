@@ -59,6 +59,10 @@ initStatusFit();
     const mdPref = localStorage.getItem('px0.mdPreview');
     S.mdPreview = mdPref !== null ? mdPref === 'true' : true;
 
+    // Restore HTML preview (default ON)
+    const htmlPref = localStorage.getItem('px0.htmlPreview');
+    S.htmlPreview = htmlPref !== null ? htmlPref === 'true' : true;
+
     updateEditorOptionControls();
   } catch {}
 

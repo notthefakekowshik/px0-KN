@@ -623,3 +623,44 @@ func TestMetaIncludesVersion(t *testing.T) {
 		t.Fatalf("expected version %q in /api/meta, got %v", version, body["version"])
 	}
 }
+
+func TestHTMLPreviewEndpoints(t *testing.T) {
+	s, root := newTestServer(t)
+	htmlContent := "<!DOCTYPE html><html><body><h1>Hello HTML</h1></body></html>"
+	p := filepath.Join(root, "page.html")
+	if err := os.WriteFile(p, []byte(htmlContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. /api/file should identify html: true
+	code, body := get(t, s, "/api/file?path=page.html")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/file, got %d: %v", code, body)
+	}
+	if isHtml, ok := body["html"].(bool); !ok || !isHtml {
+		t.Errorf("expected html: true in /api/file, got %v", body["html"])
+	}
+
+	// 2. /api/raw?path=page.html serves raw HTML
+	rec1 := httptest.NewRecorder()
+	s.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/api/raw?path=page.html", nil))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/raw?path=page.html, got %d", rec1.Code)
+	}
+	if !strings.Contains(rec1.Body.String(), "Hello HTML") {
+		t.Errorf("expected body to contain 'Hello HTML', got %q", rec1.Body.String())
+	}
+	if ct := rec1.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("expected Content-Type text/html, got %q", ct)
+	}
+
+	// 3. /api/raw/page.html path-based routing serves the same file
+	rec2 := httptest.NewRecorder()
+	s.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/raw/page.html", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/raw/page.html, got %d", rec2.Code)
+	}
+	if !strings.Contains(rec2.Body.String(), "Hello HTML") {
+		t.Errorf("expected body to contain 'Hello HTML', got %q", rec2.Body.String())
+	}
+}

@@ -1,8 +1,15 @@
 import { $, S, doc_, api } from './state.js';
 import { previewing } from './markdown.js';
+import { copyToClipboard } from './ui.js';
 
 export function updateStatus() {
   const d = doc_();
+  const pathEl = $('#st-path');
+  if (pathEl) {
+    pathEl.textContent = d ? d.path : '';
+    pathEl.title = d ? `${d.path} (Click to copy path)` : '';
+  }
+
   const sizeEl = $('#st-size');
   if (sizeEl) sizeEl.textContent = d ? fmtBytes(d.size) : '';
 
@@ -112,6 +119,15 @@ export function fitStatus() {
   for (let i = 1; i <= FIT_STEPS && statusEl.scrollWidth > statusEl.clientWidth; i++) {
     statusEl.classList.add('fit-' + i);
   }
+}
+
+export function initStatus() {
+  $('#st-path')?.addEventListener('click', () => {
+    const d = doc_();
+    if (d && d.path) {
+      copyToClipboard(d.path, 'Copied path: ' + d.path);
+    }
+  });
 }
 
 export function initStatusFit() {

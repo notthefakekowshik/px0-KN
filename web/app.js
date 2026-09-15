@@ -2428,6 +2428,12 @@ function initMarkdown() {
 // --- File: web/src/status.js ---
 function updateStatus() {
   const d = doc_();
+  const pathEl = $('#st-path');
+  if (pathEl) {
+    pathEl.textContent = d ? d.path : '';
+    pathEl.title = d ? `${d.path} (Click to copy path)` : '';
+  }
+
   const sizeEl = $('#st-size');
   if (sizeEl) sizeEl.textContent = d ? fmtBytes(d.size) : '';
 
@@ -2537,6 +2543,15 @@ function fitStatus() {
   for (let i = 1; i <= FIT_STEPS && statusEl.scrollWidth > statusEl.clientWidth; i++) {
     statusEl.classList.add('fit-' + i);
   }
+}
+
+function initStatus() {
+  $('#st-path')?.addEventListener('click', () => {
+    const d = doc_();
+    if (d && d.path) {
+      copyToClipboard(d.path, 'Copied path: ' + d.path);
+    }
+  });
 }
 
 function initStatusFit() {
@@ -3629,6 +3644,7 @@ initShortcuts();
 initMarkdown();
 initDiff();
 initMetrics();
+initStatus();
 initStatusFit();
 
 // Bootstrap application lifecycle

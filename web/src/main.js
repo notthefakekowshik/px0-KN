@@ -17,7 +17,9 @@ import { initShortcuts } from './shortcuts.js';
 import { initTheme } from './theme.js';
 import { initMarkdown } from './markdown.js';
 import { initDiff } from './diff.js';
+import { initAgent, applyAgentMeta, loadAgentAsync } from './agent.js';
 import { updateStatus, initMetrics, initStatusFit, initStatus, updateMetricsDisplay } from './status.js';
+import { initSettings } from './settings.js';
 
 // Initialize all subsystems
 initRenderer();
@@ -36,9 +38,11 @@ initPalette();
 initShortcuts();
 initMarkdown();
 initDiff();
+initAgent();
 initMetrics();
 initStatus();
 initStatusFit();
+initSettings();
 
 // Bootstrap application lifecycle
 (async function boot() {
@@ -50,10 +54,9 @@ initStatusFit();
     S.wrap = wrapPref !== null ? wrapPref === 'true' : true;
     document.body.classList.toggle('word-wrap', S.wrap);
 
-    // Restore line numbers (default ON)
-    const linesPref = localStorage.getItem('px0.lineNumbers');
-    S.lineNumbers = linesPref !== null ? linesPref === 'true' : true;
-    document.body.classList.toggle('hide-lines', !S.lineNumbers);
+    // Line numbers are always ON
+    S.lineNumbers = true;
+    document.body.classList.remove('hide-lines');
 
     // Restore Markdown preview (default ON)
     const mdPref = localStorage.getItem('px0.mdPreview');
@@ -72,6 +75,7 @@ initStatusFit();
   S.meta = await api('/api/meta');
   if (S.meta.metrics) updateMetricsDisplay(S.meta.metrics);
   if (S.meta.git) { const b = $('#btn-changed'); if (b) b.hidden = false; }
+  applyAgentMeta();
   document.title = S.meta.name + ' - px0';
   $('#root-name').textContent = S.meta.name;
   $('#root-name').title = S.meta.root;
@@ -118,4 +122,7 @@ initStatusFit();
       }
     }, 150);
   }
+
+  // Load harnesses and models asynchronously after the browser is loaded.
+  loadAgentAsync();
 })();

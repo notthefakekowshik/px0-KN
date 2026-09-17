@@ -1,7 +1,7 @@
 // web/src/shortcuts.js
 import { $, $$, esc, S, doc_, isMac, MOD, LH, keyCaps } from './state.js';
 import { vp, sizer } from './ui.js';
-import { layout, render, paint, toggleWordWrap, toggleLineNumbers } from './renderer.js';
+import { layout, render, paint, toggleWordWrap } from './renderer.js';
 import { updateStatus } from './status.js';
 import { closeTab, switchTab, reopenClosedTab } from './tabs.js';
 import { go } from './history.js';
@@ -10,18 +10,20 @@ import { openFind, clearFind, findbar } from './find.js';
 import { gotoDefinition, findReferences } from './lsp.js';
 import { showRightInspector, hideRightInspector } from './inspector.js';
 import { overlay, openPalette, closePalette } from './palette.js';
-import { moveCursor, moveCol, caretToEdge } from './cursor.js';
+import { moveCursor, moveCol, moveWord, caretToEdge } from './cursor.js';
 import { showCalls } from './calls.js';
 import { SEL_KEYS, runSelectionAction, selectAll, clearSelectAll, copySelectAll } from './selbar.js';
 
 import { cycleTheme } from './theme.js';
 import { previewing, togglePreview, previewKey, selectPreview } from './markdown.js';
 import { toggleDiff } from './diff.js';
+import { openSettings, closeSettings, isSettingsOpen } from './settings.js';
 
 /* Each entry lists alternative combos, written as for keyLabel in state.js so
    they show as ⌘/⌥/⇧ on a Mac and Ctrl/Alt/Shift elsewhere. Browsers keep
    Ctrl+W and Cmd+W for themselves, so Alt+W is the close shortcut shown. */
 export const SHORTCUTS = [
+  [['Mod+,'], 'Open settings'],
   [['Mod+K'], 'Quick search / palette'], [['Mod+P'], 'Go to file'],
   [['Mod+Shift+P'], 'Command palette'], [['Mod+Shift+O'], 'Go to symbol'],
   [['Mod+Shift+F'], 'Search in files'], [['Mod+F'], 'Find in file'],
@@ -35,7 +37,9 @@ export const SHORTCUTS = [
   [['Alt+W'], 'Close tab'], [['Alt+Shift+T'], 'Reopen closed tab'], [['Ctrl+Tab'], 'Next tab'],
   [['Alt+1…9'], 'Select tab'], [['Double click'], 'Highlight all occurrences'],
   [['Mod+A'], 'Select whole file'],
-  [['Alt+C', 'Alt+A'], 'Copy selection ref / for agent'], [['Alt+U'], 'Find usages of selection'],
+  [['Alt+C', 'Alt+A'], 'Copy selection ref / with context'], [['Alt+U'], 'Find usages of selection'],
+  [['Alt+E'], 'Edit selection inline'],
+  [['Right click'], 'Selection actions at the pointer'],
   [['Mod+Home|Mod+Up', 'Mod+End|Mod+Down'], 'Top / bottom of file'],
   [['Home|Mod+Left', 'End|Mod+Right'], 'Start / end of line'],
   [['Left', 'Right'], 'Move caret along the line'],
@@ -56,6 +60,7 @@ export const inField = el => el && (el.tagName === 'INPUT' || el.tagName === 'TE
 
 export function initShortcuts() {
   $('#btn-theme')?.addEventListener('click', cycleTheme);
+  $('#btn-settings')?.addEventListener('click', () => openSettings('ui'));
   $('#btn-help')?.addEventListener('click', showHelp);
   $('#st-ver')?.addEventListener('click', showHelp);
   $('#helpsheet').addEventListener('click', () => { $('#helpsheet').hidden = true; });
@@ -71,9 +76,9 @@ export function initShortcuts() {
     else if (act === 'find') openFind(S.lastWord);
     else if (act === 'goto') openPalette('line');
     else if (act === 'wrap') toggleWordWrap();
-    else if (act === 'line-numbers') toggleLineNumbers();
     else if (act === 'md-preview') togglePreview();
     else if (act === 'palette') openPalette('command');
+    else if (act === 'settings') openSettings('ui');
     else if (act === 'help') showHelp();
   });
 
@@ -81,6 +86,7 @@ export function initShortcuts() {
     const mod = e[MOD];
 
     if (e.key === 'Escape') {
+      if (isSettingsOpen()) { closeSettings(); return; }
       if (!overlay.hidden) { closePalette(); return; }
       if (!$('#helpsheet').hidden) { $('#helpsheet').hidden = true; return; }
       if (!hovercard.hidden) { clearLink(); return; }
@@ -89,6 +95,12 @@ export function initShortcuts() {
       if (!document.body.classList.contains('right-hidden')) { hideRightInspector(); return; }
       if (S.occ) { S.occ = null; paint(); return; }
       if (inField(document.activeElement)) document.activeElement.blur();
+      return;
+    }
+
+    if (mod && (e.key === ',' || e.key === '<')) {
+      e.preventDefault();
+      openSettings('ui');
       return;
     }
 
@@ -156,12 +168,6 @@ export function initShortcuts() {
       return;
     }
 
-    if (e.altKey && e.code === 'KeyL') {
-      e.preventDefault();
-      toggleLineNumbers();
-      return;
-    }
-
     if (e.altKey && !mod && !e.shiftKey && e.code === 'KeyM') {
       e.preventDefault();
       togglePreview();
@@ -181,19 +187,22 @@ export function initShortcuts() {
     if (previewing(d)) { if (previewKey(e)) e.preventDefault(); return; }
     const toTop = () => { vp.scrollTop = 0; d.cur = 1; render(); updateStatus(); };
     const toBottom = () => { vp.scrollTop = sizer.offsetHeight; d.cur = d.total; render(); updateStatus(); };
-    if (mod && e.key === 'Home') { e.preventDefault(); toTop(); return; }
-    if (mod && e.key === 'End') { e.preventDefault(); toBottom(); return; }
+    const shift = e.shiftKey;
+    if (mod && e.key === 'Home') { e.preventDefault(); if (shift) caretToEdge(false, true); else toTop(); return; }
+    if (mod && e.key === 'End') { e.preventDefault(); if (shift) caretToEdge(true, true); else toBottom(); return; }
     // A Mac keyboard has no Home or End: Cmd with the arrows does their job there.
     if (isMac && mod && e.key === 'ArrowUp') { e.preventDefault(); toTop(); return; }
     if (isMac && mod && e.key === 'ArrowDown') { e.preventDefault(); toBottom(); return; }
-    if (isMac && mod && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); caretToEdge(e.key === 'ArrowRight'); return; }
-    if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); moveCursor(1); return; }
-    if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); moveCursor(-1); return; }
-    if (!mod && !e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); moveCol(-1); return; }
-    if (!mod && !e.altKey && e.key === 'ArrowRight') { e.preventDefault(); moveCol(1); return; }
-    if (!mod && (e.key === 'Home' || e.key === 'End')) { e.preventDefault(); caretToEdge(e.key === 'End'); return; }
-    if (e.key === 'PageDown') { e.preventDefault(); moveCursor(Math.floor(vp.clientHeight / LH) - 2); return; }
-    if (e.key === 'PageUp') { e.preventDefault(); moveCursor(-(Math.floor(vp.clientHeight / LH) - 2)); return; }
+    if (isMac && mod && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); caretToEdge(e.key === 'ArrowRight', shift); return; }
+    if (mod && !isMac && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); moveWord(e.key === 'ArrowRight' ? 1 : -1, shift); return; }
+    if (isMac && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); moveWord(e.key === 'ArrowRight' ? 1 : -1, shift); return; }
+    if (!mod && (e.key === 'ArrowDown' || e.key === 'j')) { e.preventDefault(); moveCursor(1, shift); return; }
+    if (!mod && (e.key === 'ArrowUp' || e.key === 'k')) { e.preventDefault(); moveCursor(-1, shift); return; }
+    if (!mod && !e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); moveCol(-1, shift); return; }
+    if (!mod && !e.altKey && e.key === 'ArrowRight') { e.preventDefault(); moveCol(1, shift); return; }
+    if (!mod && (e.key === 'Home' || e.key === 'End')) { e.preventDefault(); caretToEdge(e.key === 'End', shift); return; }
+    if (e.key === 'PageDown') { e.preventDefault(); moveCursor(Math.floor(vp.clientHeight / LH) - 2, shift); return; }
+    if (e.key === 'PageUp') { e.preventDefault(); moveCursor(-(Math.floor(vp.clientHeight / LH) - 2), shift); return; }
   }, { capture: true });
 
 

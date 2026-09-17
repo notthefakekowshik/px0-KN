@@ -8,17 +8,18 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-const request = async (method, path, params) => {
+const request = async (method, path, params, opts = {}) => {
   const u = new URL(path, location.origin);
   for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== '') u.searchParams.set(k, v);
-  const r = await fetch(u, { method });
+  const r = await fetch(u, { method, ...opts });
   const j = await r.json();
-  if (j.error) throw new Error(j.error);
+  // The body rides along: some replies, like a failed agent job, carry detail beyond the message.
+  if (j.error) throw Object.assign(new Error(j.error), { body: j });
   return j;
 };
-const api = (path, params) => request('GET', path, params);
+const api = (path, params, opts) => request('GET', path, params, opts);
 // For requests that change the machine; the server only accepts these as POST from this page.
-const apiPost = (path, params) => request('POST', path, params);
+const apiPost = (path, params, opts) => request('POST', path, params, opts);
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 // navigator.platform is deprecated but is still the only signal some browsers give.
 const isMac = /mac|iphone|ipad/i.test(navigator.userAgentData?.platform || navigator.platform || '');
@@ -75,6 +76,8 @@ const S = {
   lineNumbers: true, // line numbers gutter (default ON)
   mdPreview: true,   // Markdown tabs open rendered (default ON)
   htmlPreview: true, // HTML tabs open rendered (default ON)
+  settings: null,    // loaded from /api/settings
+  agentTargets: [],  // [{ id, path, l1, l2 }, ...] ranges of open compose/edit sessions
 };
 const doc_ = () => (S.active >= 0 ? S.tabs[S.active] : null);
 
@@ -87,15 +90,39 @@ const editor = $('#editor');
 const toastEl = $('#toast');
 
 let toastTimer = 0;
-function showToast(accentText, text) {
+let toastLeaveTimer = 0;
+
+function showToast(accentText, text, duration = 2200) {
   if (!toastEl) return;
-  toastEl.innerHTML = (accentText ? '<span class="toast-accent">' + esc(accentText) + '</span> ' : '') + esc(text);
-  toastEl.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { toastEl.hidden = true; }, 2200);
+  clearTimeout(toastLeaveTimer);
+
+  toastEl.classList.remove('toast-hide');
+
+  let iconHtml = '';
+  if (accentText) {
+    if (accentText === '✓') {
+      iconHtml = '<span class="toast-icon toast-icon-ok"><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-6"/></svg></span>';
+    } else if (accentText === '!') {
+      iconHtml = '<span class="toast-icon toast-icon-warn"><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="8" y1="4" x2="8" y2="9"/><circle cx="8" cy="12.5" r="0.6" fill="currentColor"/></svg></span>';
+    } else {
+      iconHtml = '<span class="toast-chip">' + esc(accentText) + '</span>';
+    }
+  }
+
+  toastEl.innerHTML = iconHtml + '<span class="toast-msg">' + esc(text) + '</span>';
+  toastEl.hidden = false;
+
+  toastTimer = setTimeout(() => {
+    toastEl.classList.add('toast-hide');
+    toastLeaveTimer = setTimeout(() => {
+      toastEl.hidden = true;
+      toastEl.classList.remove('toast-hide');
+    }, 180);
+  }, duration);
 }
 
-async function copyToClipboard(text, notify = 'Copied to clipboard') {
+async function copyToClipboard(text, notify = 'Copied') {
   try {
     await navigator.clipboard.writeText(text);
     showToast('✓', notify);
@@ -132,7 +159,7 @@ function layout() {
   if (!d) return;
   const digits = String(d.total).length;
   editor.style.setProperty('--gw', digits);
-  const gutter = S.lineNumbers ? (digits * S.chW + 30) : 16;
+  const gutter = digits * S.chW + 30;
   const w = S.wrap ? vp.clientWidth : Math.max(vp.clientWidth, gutter + (d.maxCols + 4) * S.chW);
   sizer.style.height = (d.total * LH + Math.max(120, vp.clientHeight * 0.5)) + 'px';
   sizer.style.width = w + 'px';
@@ -151,8 +178,20 @@ function toggleWordWrap(forced) {
 function toggleLineNumbers(forced) {
   S.lineNumbers = typeof forced === 'boolean' ? forced : !S.lineNumbers;
   document.body.classList.toggle('hide-lines', !S.lineNumbers);
-  try { localStorage.setItem('px0.lineNumbers', S.lineNumbers ? 'true' : 'false'); } catch {}
-  updateEditorOptionControls();
+  layout();
+  render();
+}
+
+function applyEditorTypography(fontSize, fontFamily, lineHeight, tabSize) {
+  if (fontSize) document.documentElement.style.setProperty('--fs', fontSize + 'px');
+  if (fontFamily) document.documentElement.style.setProperty('--mono', fontFamily);
+  if (lineHeight) {
+    document.documentElement.style.setProperty('--lh', lineHeight + 'px');
+  } else if (fontSize) {
+    document.documentElement.style.setProperty('--lh', Math.round(fontSize * 1.5) + 'px');
+  }
+  if (tabSize) document.documentElement.style.setProperty('--tab-size', tabSize);
+  measure();
   layout();
   render();
 }
@@ -160,8 +199,6 @@ function toggleLineNumbers(forced) {
 function updateEditorOptionControls() {
   const wrapBtn = $('[data-action="wrap"]');
   if (wrapBtn) wrapBtn.classList.toggle('active', !!S.wrap);
-  const linesBtn = $('[data-action="line-numbers"]');
-  if (linesBtn) linesBtn.classList.toggle('active', !!S.lineNumbers);
 }
 
 let raf = 0;
@@ -181,11 +218,13 @@ function paint() {
 
   let html = '';
   const gut = d.gutter || null;
+  const agentRanges = (S.agentTargets || []).filter(t => t.path === d.path);
   for (let i = first; i < last; i++) {
     const n = i + 1;
     const body = d.lines[i];
     let rc = 'row', gc = 'g';
     if (n === d.cur) rc += ' cur';
+    if (agentRanges.some(r => n >= r.l1 && n <= r.l2)) rc += ' agent-sel';
     if (gut) {
       const m = gut.marks.get(n);
       if (m) gc += m === 'add' ? ' gut-add' : ' gut-mod';
@@ -235,7 +274,7 @@ function placeCaret() {
   }
   // Scrolled horizontally under the sticky gutter: hide rather than draw over it.
   const g = $('.g', row);
-  if (g && S.lineNumbers && x < g.getBoundingClientRect().right - 1) { el.hidden = true; return null; }
+  if (g && x < g.getBoundingClientRect().right - 1) { el.hidden = true; return null; }
   el.style.transform = 'translate(' + (x - base.left) + 'px,' + (y - base.top) + 'px)';
   el.hidden = false;
   const key = d.path + ':' + d.cur + ':' + col;
@@ -678,32 +717,15 @@ function initTree() {
 
 
 
+
 function showPanel(name) {
   document.body.classList.remove('side-hidden');
-  const filesPanel = $('#panel-files');
-  const searchPanel = $('#panel-search');
-  if (name === 'search') {
-    filesPanel?.classList.remove('active');
-    searchPanel?.classList.add('active');
-    const q = $('#q');
-    if (q) {
-      q.focus();
-      q.select();
-    }
-  } else {
-    searchPanel?.classList.remove('active');
-    filesPanel?.classList.add('active');
-  }
   layout();
   render();
 }
 
 function initPanels() {
-  $('#btn-show-search')?.addEventListener('click', () => showPanel('search'));
-  $('#btn-show-files')?.addEventListener('click', () => showPanel('files'));
-
   $('#btn-reindex').addEventListener('click', async () => {
-    $('#st-index').textContent = 'reindexing…';
     const j = await api('/api/reindex');
     S.meta.files = j.files; S.meta.indexMs = j.indexMs;
     treeEl.innerHTML = ''; openDirs.clear();
@@ -711,6 +733,7 @@ function initPanels() {
     // Reindex is a refresh: re-fetch open tabs quietly in place without tab switching.
     await reloadOpenTabs();
     updateStatus();
+    showToast('✓', 'Workspace reindexed');
   });
 
   /* sidebar resize */
@@ -840,14 +863,29 @@ function initFind() {
 const resultsEl = $('#results');
 let lastResults = null;
 
+let searchAbort = null;
+
+function cancelSearch() {
+  if (searchAbort) {
+    searchAbort.abort();
+    searchAbort = null;
+  }
+}
+
 // The search panel is optional markup; without it every entry point is a no-op.
 const runSearch = debounce(async () => {
   const qEl = $('#q');
-  const resEl = $('#results');
-  if (!qEl || !resEl) return;
+  if (!qEl || !resultsEl) return;
   const q = qEl.value;
-  if (!q.trim()) { resEl.innerHTML = ''; return; }
-  resEl.innerHTML = '<div class="hint">searching…</div>';
+  if (!q.trim()) {
+    cancelSearch();
+    resultsEl.innerHTML = '';
+    return;
+  }
+  cancelSearch();
+  const controller = new AbortController();
+  searchAbort = controller;
+  resultsEl.innerHTML = '<div class="hint">searching…</div>';
   const params = {
     q, glob: $('#glob')?.value || '',
     case: $('#o-case')?.classList.contains('on') ? 1 : '',
@@ -855,19 +893,25 @@ const runSearch = debounce(async () => {
     re: $('#o-re')?.classList.contains('on') ? 1 : '',
   };
   try {
-    const j = await api('/api/search', params);
-    renderResults(j);
+    const j = await api('/api/search', params, { signal: controller.signal });
+    if (searchAbort === controller) {
+      searchAbort = null;
+      renderResults(j);
+    }
   } catch (e) {
-    resEl.innerHTML = '<div class="hint">' + esc(e.message) + '</div>';
+    if (e.name === 'AbortError') return;
+    if (searchAbort === controller) {
+      searchAbort = null;
+      resultsEl.innerHTML = '<div class="hint">' + esc(e.message) + '</div>';
+    }
   }
 }, 160);
 
 function renderResults(j) {
   lastResults = j;
-  const resEl = $('#results');
-  if (!resEl) return;
+  if (!resultsEl) return;
   if (!j.results || !j.results.length) {
-    resEl.innerHTML = '<div class="hint">No results.</div>';
+    resultsEl.innerHTML = '<div class="hint">No results.</div>';
     return;
   }
   const head = j.header || (j.total.toLocaleString() + ' result' + (j.total === 1 ? '' : 's') +
@@ -887,7 +931,7 @@ function renderResults(j) {
     }
     html += '</div>';
   }
-  resEl.innerHTML = html;
+  resultsEl.innerHTML = html;
 }
 
 /* External results carry an absolute path, which is far too long for the
@@ -899,35 +943,31 @@ function displayPath(p) {
 }
 
 function initSearch() {
-  const resEl = $('#results');
-  const qEl = $('#q');
-  if (!resEl || !qEl) return;
-  resEl.addEventListener('click', e => {
+  if (!resultsEl) return;
+  resultsEl.addEventListener('click', e => {
     const t = e.target.closest('[data-toggle]');
     if (t) {
-      const g = resEl.querySelector('[data-group="' + CSS.escape(t.dataset.toggle) + '"]');
-      if (g) {
-        const hidden = g.style.display === 'none';
-        g.style.display = hidden ? '' : 'none';
-        $('.ar', t).innerHTML = hidden ? '&#9660;' : '&#9654;';
-      }
+      const g = resultsEl.querySelector('[data-group="' + CSS.escape(t.dataset.toggle) + '"]');
+      const hidden = g.style.display === 'none';
+      g.style.display = hidden ? '' : 'none';
+      $('.ar', t).innerHTML = hidden ? '&#9660;' : '&#9654;';
       return;
     }
     const r = e.target.closest('.rline');
     if (r) {
-      $$('.rline.sel', resEl).forEach(x => x.classList.remove('sel'));
+      $$('.rline.sel', resultsEl).forEach(x => x.classList.remove('sel'));
       r.classList.add('sel');
       openFile(r.dataset.p, { line: +r.dataset.n });
-      const q = qEl.value;
+      const q = $('#q').value;
       if (q) flashFind(q);
     }
   });
 
-  qEl.addEventListener('input', runSearch);
-  $('#glob')?.addEventListener('input', runSearch);
-  $$('.opt', $('#panel-search')).forEach(b => b.addEventListener('click', () => { b.classList.toggle('on'); runSearch(); }));
-  qEl.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); const f = $('.rline', resEl); if (f) f.click(); }
+  $('#q').addEventListener('input', runSearch);
+  $('#glob').addEventListener('input', runSearch);
+  $$('.opt').forEach(b => b.addEventListener('click', () => { b.classList.toggle('on'); runSearch(); }));
+  $('#q').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); const f = $('.rline', resultsEl); if (f) f.click(); }
   });
 }
 
@@ -949,12 +989,14 @@ function showRightInspector(tab = 'refs') {
 }
 
 function hideRightInspector() {
+  cancelSearch();
   document.body.classList.add('right-hidden');
   layout();
   render();
 }
 
 function setRightInspectorTab(tab) {
+  if (tab !== 'search') cancelSearch();
   $$('.inspector-tab').forEach(b => b.classList.toggle('active', b.dataset.itab === tab));
   $('#pane-right-refs')?.classList.toggle('active', tab === 'refs');
   $('#pane-right-symbols')?.classList.toggle('active', tab === 'symbols');
@@ -1016,11 +1058,12 @@ async function inspectReferences(arg) {
   if (listEl) listEl.innerHTML = '<div class="hint">Finding references for "' + esc(at.word) + '"…</div>';
 
   if (canAskServer(at)) {
-    setStatusNote('references to ' + at.word + '…');
+    setStatusNote('references to ' + at.word + '…', 8000);
     try {
       const j = await lspCall('refs', at, 30000);
       updateStatus();
       if (j && j.hits && j.hits.length) {
+        setStatusNote('');
         renderRightResults(at.word, j.hits, j.server, true);
         return;
       }
@@ -1030,10 +1073,11 @@ async function inspectReferences(arg) {
   }
 
   // Fallback: search workspace text for whole word
-  setStatusNote('searching references to ' + at.word + '…');
+  setStatusNote('searching references to ' + at.word + '…', 8000);
   try {
     const j = await api('/api/search', { q: at.word, word: true, case: true });
     updateStatus();
+    setStatusNote('');
     const hits = [];
     if (j.results) {
       for (const f of j.results) {
@@ -1045,6 +1089,7 @@ async function inspectReferences(arg) {
     renderRightResults(at.word, hits, '', false);
   } catch (err) {
     updateStatus();
+    setStatusNote('');
     if (listEl) listEl.innerHTML = '<div class="hint">Search error: ' + esc(err.message) + '</div>';
   }
 }
@@ -1169,7 +1214,7 @@ async function gotoDefinition(arg) {
   if (!d || !at) return;
 
   if (canAskServer(at)) {
-    setStatusNote('definition of ' + at.word + '…');
+    setStatusNote('definition of ' + at.word + '…', 8000);
     const j = await lspCall('def', at, S.lsp.state === 'ready' ? 5000 : 20000);
     updateStatus();
     if (j && j.hits && j.hits.length) {
@@ -1191,10 +1236,10 @@ async function gotoDefinition(arg) {
     });
   }
 
-  setStatusNote('searching for ' + at.word + '…');
+  setStatusNote('searching for ' + at.word + '…', 8000);
   let rx;
   try { rx = await api('/api/def', { sym: at.word, path: d.path }); }
-  catch (e) { setStatusNote(e.message); return; }
+  catch (e) { setStatusNote(e.message, 4000); return; }
   updateStatus();
   if (rx.lsp) setLspState(rx.lsp);
 
@@ -1222,13 +1267,15 @@ function acceptHits(word, hits, server, noun, refCount) {
     const h = repoHits[0];
     openFile(h.path, { line: h.line });
     flashFind(h.mid || word);
-    setStatusNote(server ? server + ' · ' + h.path + ':' + h.line : h.path + ':' + h.line);
+    setStatusNote(server ? server + ' · ' + h.path + ':' + h.line : h.path + ':' + h.line, 4000);
     return;
   }
+  setStatusNote('');
   showHits(word, repoHits, server, noun, refCount);
 }
 
 function showHits(word, hits, server, noun, refCount) {
+  setStatusNote('');
   const n = hits.length;
   let head = n + ' ' + noun + (n === 1 ? '' : 's') + ' of "' + word + '"';
   head += server ? '  ·  ' + server : '  ·  text match, no language server';
@@ -1446,52 +1493,158 @@ function revealCaretX(x) {
   const d = doc_();
   if (x == null || S.wrap || !d) return;
   const g = rowFor(d.cur)?.querySelector('.g');
-  const gw = S.lineNumbers && g ? g.offsetWidth : 0;
+  const gw = g ? g.offsetWidth : 0;
   if (x < vp.scrollLeft + gw + 8) vp.scrollLeft = Math.max(0, x - gw - 40);
   else if (x > vp.scrollLeft + vp.clientWidth - 24) vp.scrollLeft = x - vp.clientWidth + 60;
 }
 
+function updateDomSelection() {
+  const d = doc_();
+  if (!d) return;
+  const sel = window.getSelection();
+  if (!sel) return;
+  if (!d.selAnchor) {
+    if (sel.rangeCount && !sel.isCollapsed && vp.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+      sel.removeAllRanges();
+    }
+    return;
+  }
+  const pa = toPoint(d.selAnchor);
+  const headCol = d.col === Infinity ? (rowFor(d.cur) ? $('.c', rowFor(d.cur)).textContent.length : 0) : (d.col || 0);
+  const pf = toPoint({ line: d.cur, col: headCol });
+  if (pa && pf) {
+    sel.setBaseAndExtent(pa[0], pa[1], pf[0], pf[1]);
+  }
+}
+
+function ensureAnchor(d) {
+  if (!d.selAnchor) {
+    const col = d.col === Infinity ? (rowFor(d.cur) ? $('.c', rowFor(d.cur)).textContent.length : 0) : (d.col || 0);
+    d.selAnchor = { line: d.cur, col };
+  }
+}
+
+function clearSelection(d) {
+  if (d) d.selAnchor = null;
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount && !sel.isCollapsed && vp.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+    sel.removeAllRanges();
+  }
+}
+
 /* Left/Right along the line, wrapping onto the neighbouring line at either end. */
-function moveCol(delta) {
+function moveCol(delta, shift = false) {
   const d = doc_(); if (!d) return;
+  if (shift) ensureAnchor(d);
+  else d.selAnchor = null;
+
   const row = rowFor(d.cur);
   const len = row ? $('.c', row).textContent.length : 0;
   const col = Math.min(d.col || 0, len) + delta;
   if (col < 0) {
-    if (d.cur > 1) { d.col = Infinity; moveCursor(-1); } // clamped to the line end when placed
+    if (d.cur > 1) { d.col = Infinity; moveCursor(-1, shift); }
+    else updateDomSelection();
     return;
   }
   if (col > len) {
-    if (d.cur < d.total) { d.col = 0; moveCursor(1); }
+    if (d.cur < d.total) { d.col = 0; moveCursor(1, shift); }
+    else updateDomSelection();
     return;
   }
   d.col = col;
   revealCaretX(placeCaret());
+  updateDomSelection();
 }
 
-function caretToEdge(end) {
+/* Jump by word boundary left/right */
+function moveWord(delta, shift = false) {
   const d = doc_(); if (!d) return;
+  if (shift) ensureAnchor(d);
+  else d.selAnchor = null;
+
+  const row = rowFor(d.cur);
+  const text = row ? $('.c', row).textContent : '';
+  const len = text.length;
+  let col = Math.min(d.col === Infinity ? len : (d.col || 0), len);
+
+  if (delta < 0) {
+    if (col === 0) {
+      if (d.cur > 1) { d.col = Infinity; moveCursor(-1, shift); }
+      return;
+    }
+    col--;
+    while (col > 0 && /\s/.test(text[col])) col--;
+    if (WORD.test(text[col])) {
+      while (col > 0 && WORD.test(text[col - 1])) col--;
+    } else {
+      while (col > 0 && !WORD.test(text[col - 1]) && !/\s/.test(text[col - 1])) col--;
+    }
+  } else {
+    if (col >= len) {
+      if (d.cur < d.total) { d.col = 0; moveCursor(1, shift); }
+      return;
+    }
+    if (WORD.test(text[col])) {
+      while (col < len && WORD.test(text[col])) col++;
+    } else if (!/\s/.test(text[col])) {
+      while (col < len && !WORD.test(text[col]) && !/\s/.test(text[col])) col++;
+    }
+    while (col < len && /\s/.test(text[col])) col++;
+  }
+  d.col = col;
+  revealCaretX(placeCaret());
+  updateDomSelection();
+}
+
+function caretToEdge(end, shift = false) {
+  const d = doc_(); if (!d) return;
+  if (shift) ensureAnchor(d);
+  else d.selAnchor = null;
+
   d.col = end ? Infinity : 0;
   revealCaretX(placeCaret());
+  updateDomSelection();
 }
 
-function moveCursor(delta) {
+function moveCursor(delta, shift = false) {
   const d = doc_(); if (!d) return;
+  if (shift) ensureAnchor(d);
+  else d.selAnchor = null;
+
   d.cur = Math.max(1, Math.min(d.total, d.cur + delta));
   const y = (d.cur - 1) * LH;
   if (y < vp.scrollTop) vp.scrollTop = y - LH;
   else if (y > vp.scrollTop + vp.clientHeight - LH * 2) vp.scrollTop = y - vp.clientHeight + LH * 3;
   render(); updateStatus();
+  updateDomSelection();
 }
 
 function initCursor() {
   vp.addEventListener('mousedown', e => {
+    // Only the primary button moves the caret: a right click opens a menu on
+    // what is already selected and must leave it where it is.
+    if (e.button !== 0) return;
     const row = e.target.closest('.row');
     if (!row) return;
     const d = doc_(); if (!d) return;
-    d.cur = +row.dataset.l;
+    const targetLine = +row.dataset.l;
     const p = colAtPoint(e.clientX, e.clientY);
-    d.col = p && p.line === d.cur ? p.col : 0;
+    const targetCol = p && p.line === targetLine ? p.col : 0;
+
+    if (e.shiftKey) {
+      ensureAnchor(d);
+      d.cur = targetLine;
+      d.col = targetCol;
+      placeCaret();
+      updateStatus();
+      updateDomSelection();
+      for (const r of rowsEl.children) r.classList.toggle('cur', +r.dataset.l === d.cur);
+      return;
+    }
+
+    d.selAnchor = null;
+    d.cur = targetLine;
+    d.col = targetCol;
     placeCaret(); // no repaint here: rewriting rows would break the drag that starts a selection
     updateStatus();
     const w = wordAtPoint(e.clientX, e.clientY);
@@ -1680,7 +1833,7 @@ function wire(el, d, onReady) {
 
 let T = null;       // { path, word, dir, roots: [node] }
 let dirPref = 'in'; // 'in' = callers, 'out' = callees
-let seq = 0;
+let callSeq = 0;
 const flat = [];    // node by row index, rebuilt on every draw
 
 const listEl = () => $('#right-calls-list');
@@ -1721,21 +1874,22 @@ async function showCalls(arg) {
   }
   if (!at || at.imprecise) { hint('Click a function name in the editor, then press <b>' + esc(keyLabel('Alt+Shift+H')) + '</b>.'); return; }
 
-  const my = ++seq;
+  const my = ++callSeq;
   T = null;
   $('#right-calls-target').textContent = at.word;
   hint('Tracing calls for "' + esc(at.word) + '"…');
-  setStatusNote('call trail for ' + at.word + '…');
+  setStatusNote('call trail for ' + at.word + '…', 8000);
   let j;
   try {
     j = await api('/api/lsp/calls', { path: d.path, line: at.line, col: at.col, wait: S.lsp.state === 'ready' ? 10000 : 30000 });
   } catch (e) {
-    if (my === seq) { updateStatus(); hint('Could not trace "' + esc(at.word) + '": ' + esc(explain(e.message))); }
+    if (my === callSeq) { updateStatus(); setStatusNote(''); hint('Could not trace "' + esc(at.word) + '": ' + esc(explain(e.message))); }
     return;
   }
-  if (my !== seq) return;
+  if (my !== callSeq) return;
   setLspState(j);
   updateStatus();
+  setStatusNote('');
   if (!j.nodes || !j.nodes.length) {
     hint('"' + esc(at.word) + '" is not a function ' + esc(j.server || 'the language server') + ' can trace.');
     return;
@@ -1880,6 +2034,7 @@ function onMove({ x, y, mod }) {
     else return; // still on the same word: nothing to do
   }
 
+  if (S.settings && (S.settings['lsp.hover.enabled'] === false || S.settings['lsp.enabled'] === false)) return;
   if (S.lsp.state !== 'ready' && S.lsp.state !== 'indexing') return;
   clearTimeout(hoverTimer);
   hoverTimer = setTimeout(() => hoverAt(x, y), HOVER_DELAY);
@@ -1909,7 +2064,7 @@ async function showHover(at, x, y) {
     (j.doc ? '<div class="doc">' + esc(j.doc) + '</div>' : '') +
     '<div class="actions">' +
       '<button id="hc-copy-ref" title="Copy file and line reference">Copy Ref</button>' +
-      '<button id="hc-copy-ai" title="Copy snippet with file path for AI Agent / LLMs">Copy for Agent</button>' +
+      '<button id="hc-copy-ai" title="Copy snippet with file path and line numbers">Copy with Context</button>' +
       '<button id="hc-find-refs" title="Find all usages across codebase">Usages</button>' +
       '<button id="hc-calls" title="' + withKeys('Trace callers and callees ({Alt+Shift+H})') + '">Calls</button>' +
     '</div>' +
@@ -1923,14 +2078,15 @@ async function showHover(at, x, y) {
 
   if (btnRef) btnRef.onclick = (e) => {
     e.stopPropagation();
-    copyToClipboard(refPath, 'Copied ' + refPath);
+    copyToClipboard(refPath, 'Copied');
   };
   if (btnAi) btnAi.onclick = (e) => {
     e.stopPropagation();
     const lineText = d.lines[at.line - 1] || at.word || '';
     const ext = d.path.split('.').pop() || '';
-    const text = '### Reference: ' + refPath + '\n```' + ext + '\n' + lineText + '\n```';
-    copyToClipboard(text, 'Copied snippet for Agent (' + refPath + ')');
+    const lineStr = 'line ' + at.line;
+    const text = '@' + d.path + ' ' + lineStr + '\n```' + ext + '\n' + lineText + '\n```';
+    copyToClipboard(text, 'Copied');
   };
   if (btnRefs) btnRefs.onclick = (e) => {
     e.stopPropagation();
@@ -2526,18 +2682,23 @@ function syncDiffView() {
   }
 }
 
+// Read by a reload, which swaps the doc and so redraws the diff from the top.
+function diffScrollTop() {
+  return diffview.hidden ? 0 : diffview.scrollTop;
+}
+
 async function toggleDiff() {
   if (!S.meta?.git) return;
   const d = doc_();
   if (!d) return;
-  if (!d.diffMode && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
+  if (!d.diffMode && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo', 4000); return; }
   setDiffMode(d.diffMode ? 'source' : (layoutPref() || 'split'));
 }
 
 async function setDiffMode(mode) {
   const d = doc_();
   if (!d) return;
-  if (mode !== 'source' && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo'); return; }
+  if (mode !== 'source' && !d.diffAvailable) { setStatusNote('No diff — clean file or not a git repo', 4000); return; }
   if (mode === 'source') {
     d.diffMode = null;
     d.diffDismissed = true;
@@ -2562,13 +2723,17 @@ async function drawDiff(d) {
     } catch (e) {
       d.diffText = '';
       d.diffHunks = [];
-      setStatusNote('No diff: ' + e.message);
+      setStatusNote('No diff: ' + e.message, 4000);
     } finally {
       d.diffReq = null;
     }
     if (shown !== d) return;
   }
   renderDiff(d);
+  if (d.diffScroll) {
+    diffview.scrollTop = d.diffScroll;
+    d.diffScroll = 0;
+  }
 }
 
 function renderDiff(d) {
@@ -2586,12 +2751,25 @@ function renderDiff(d) {
     frag.append(d.diffMode === 'unified' ? unifiedTable(hunk) : splitTable(hunk));
   }
   diffContent.append(frag);
+  syncDiffAgentTargets();
+}
+
+function syncDiffAgentTargets() {
+  if (!diffview || diffview.hidden) return;
+  const d = doc_();
+  if (!d) return;
+  const ranges = (S.agentTargets || []).filter(t => t.path === d.path);
+  for (const el of diffview.querySelectorAll('[data-l]')) {
+    const l = +el.dataset.l;
+    const inAgent = ranges.some(r => l >= r.l1 && l <= r.l2);
+    el.classList.toggle('agent-sel', inAgent);
+  }
 }
 
 function hunkHeader(hunk) {
   const el = document.createElement('div');
   el.className = 'diff-hunk-head';
-  el.textContent = '@@ -' + hunk.oldStart + ' +' + hunk.newStart + ' @@' + (hunk.section ? ' ' + hunk.section : '');
+  el.textContent = '@@ -' + hunk.oldStart + ' +' + hunk.newStart + ' @@';
   return el;
 }
 
@@ -2619,7 +2797,8 @@ function parseDiff(text) {
     if (!cur || line === '' || line.startsWith('\\')) continue; // trailing split artifact, pre-hunk header, or "\ No newline..."
     const c = line[0], body = line.slice(1);
     if (c === '+') cur.rows.push({ type: 'add', newLine: newLine++, text: body });
-    else if (c === '-') cur.rows.push({ type: 'del', oldLine: oldLine++, text: body });
+    // A deletion has no line on disk; at is the working-tree line it sat before.
+    else if (c === '-') cur.rows.push({ type: 'del', oldLine: oldLine++, at: newLine, text: body });
     else cur.rows.push({ type: 'ctx', oldLine: oldLine++, newLine: newLine++, text: body });
   }
   return hunks;
@@ -2633,6 +2812,7 @@ function unifiedTable(hunk) {
   for (const row of hunk.rows) {
     const r = document.createElement('div');
     r.className = 'diff-row diff-' + row.type;
+    anchor(r, row);
     r.append(
       lineCell(row.type === 'add' ? '' : row.oldLine),
       lineCell(row.type === 'del' ? '' : row.newLine),
@@ -2681,8 +2861,18 @@ function splitSide(row, side) {
   el.className = 'diff-side diff-side-' + side + (row ? ' diff-' + row.type : ' diff-blank');
   if (!row) { el.append(lineCell(''), markerCell(''), codeCell('')); return el; }
   const ln = side === 'left' ? row.oldLine : row.newLine;
+  anchor(el, row);
   el.append(lineCell(ln), markerCell(row.type), codeCell(row.text));
   return el;
+}
+
+/* Stamps where a row points in the working tree, so a selection on it can be
+   edited. Context and added lines have a line on disk (data-l), which a context
+   line shares across both sides of the split. A deleted line has none, only the
+   place it used to be (data-at). */
+function anchor(el, row) {
+  if (row.newLine !== undefined) el.dataset.l = row.newLine;
+  else if (row.at !== undefined) el.dataset.at = row.at;
 }
 
 function lineCell(n) {
@@ -2714,13 +2904,15 @@ function initDiff() {
   sw.addEventListener('mousedown', e => {
     if (!e.target.closest('button')) e.preventDefault();
   });
-  const btn = $('#diff-btn');
-  if (btn) {
-    btn.addEventListener('click', e => {
-      e.stopPropagation();
-      toggleDiff();
-    });
-  }
+  // Each half of the switch names a view, so a click shows that view rather than toggling.
+  $('#diff-source')?.addEventListener('click', e => {
+    e.stopPropagation();
+    setDiffMode('source');
+  });
+  $('#diff-btn')?.addEventListener('click', e => {
+    e.stopPropagation();
+    setDiffMode(doc_()?.diffMode || layoutPref());
+  });
   const menu = $('#diff-menu');
   if (menu) {
     menu.addEventListener('click', e => {
@@ -2768,20 +2960,13 @@ function updateStatus() {
     const btn = $('#diff-btn');
     if (btn) {
       btn.classList.toggle('on', hasDiff && isDiffOn);
-      btn.title = withKeys(isDiffOn
-        ? `Diff: active (${d.diffMode === 'unified' ? 'Unified' : 'Split'}) — click to show source ({Mod+D})`
-        : `Diff: off — click to show diff ({Mod+D})`);
+      btn.title = withKeys(`Show changes against HEAD, ${currentLayout === 'unified' ? 'unified' : 'split'} ({Mod+D})`);
     }
+    $('#diff-source')?.classList.toggle('on', hasDiff && !isDiffOn);
     const menuItems = dsw.querySelectorAll('.diff-menu-item');
     for (const item of menuItems) {
       item.classList.toggle('active', item.dataset.diffOpt === currentLayout);
     }
-  }
-
-  const idxEl = $('#st-index');
-  if (idxEl && S.meta) {
-    idxEl.textContent = S.meta.indexMs + 'ms';
-    idxEl.title = `Workspace Indexing: took ${S.meta.indexMs}ms to index ${S.meta.files.toLocaleString()} files (${S.meta.ready ? 'ready' : 'in progress'})`;
   }
 
   const verEl = $('#st-ver');
@@ -2792,9 +2977,21 @@ function updateStatus() {
   drawLspStatus();
 }
 
-function setStatusNote(msg) {
+let noteTimer = null;
+
+function setStatusNote(msg, timeoutMs = 0) {
+  if (noteTimer) {
+    clearTimeout(noteTimer);
+    noteTimer = null;
+  }
   const el = $('#st-pos');
-  if (el) el.textContent = msg;
+  if (el) el.textContent = msg || '';
+  if (msg && timeoutMs > 0) {
+    noteTimer = setTimeout(() => {
+      if (el && el.textContent === msg) el.textContent = '';
+      noteTimer = null;
+    }, timeoutMs);
+  }
 }
 
 function fmtBytes(n) {
@@ -2828,15 +3025,68 @@ function drawLspStatus() {
   if (state === 'failed') el.title = 'The language server did not start. Click for details.';
 }
 
+const metricsMenuEl = $('#metrics-menu');
+let lastMetrics = null;
+
+function renderMetricsMenu(m) {
+  if (!metricsMenuEl || !m) return;
+  metricsMenuEl.innerHTML = `
+    <div class="metrics-title">
+      <span>Process Metrics</span>
+      <span class="toast-chip">px0</span>
+    </div>
+    <div class="metrics-grid">
+      <div class="metrics-row">
+        <span class="metrics-label">Resident RAM (RSS)</span>
+        <span class="metrics-val">${fmtBytes(m.rssBytes)}</span>
+      </div>
+      <div class="metrics-row">
+        <span class="metrics-label">CPU Usage</span>
+        <span class="metrics-val">${m.cpuUsage.toFixed(1)}%</span>
+      </div>
+      <div class="metrics-row">
+        <span class="metrics-label">Active Goroutines</span>
+        <span class="metrics-val">${m.goroutines || 0}</span>
+      </div>
+    </div>
+  `;
+}
+
+function closeMetricsMenu() {
+  if (metricsMenuEl) metricsMenuEl.hidden = true;
+}
+
+function placeMetricsMenu() {
+  const contEl = $('#st-metrics');
+  if (!contEl || !metricsMenuEl) return;
+  const r = contEl.getBoundingClientRect();
+  metricsMenuEl.style.bottom = (innerHeight - r.top + 6) + 'px';
+  metricsMenuEl.style.right = Math.max(8, innerWidth - r.right) + 'px';
+  metricsMenuEl.style.left = 'auto';
+}
+
+function toggleMetricsMenu() {
+  if (!metricsMenuEl) return;
+  if (!metricsMenuEl.hidden) {
+    closeMetricsMenu();
+    return;
+  }
+  if (lastMetrics) renderMetricsMenu(lastMetrics);
+  metricsMenuEl.hidden = false;
+  placeMetricsMenu();
+  refreshMetrics();
+}
+
 function updateMetricsDisplay(m) {
   if (!m) return;
+  lastMetrics = m;
   const cpuEl = $('#st-cpu');
   const ramEl = $('#st-ram');
-  const contEl = $('#st-metrics');
   if (cpuEl) cpuEl.textContent = `${m.cpuUsage.toFixed(1)}%`;
   if (ramEl) ramEl.textContent = fmtBytes(m.rssBytes);
-  if (contEl) {
-    contEl.title = `Editor OS Process Usage:\n• Resident RAM (RSS): ${fmtBytes(m.rssBytes)}\n• CPU Usage: ${m.cpuUsage.toFixed(1)}%\n• Active Goroutines: ${m.goroutines || 0}`;
+  if (metricsMenuEl && !metricsMenuEl.hidden) {
+    renderMetricsMenu(m);
+    placeMetricsMenu();
   }
 }
 
@@ -2848,6 +3098,26 @@ async function refreshMetrics() {
 }
 
 function initMetrics() {
+  const contEl = $('#st-metrics');
+  if (contEl) {
+    contEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMetricsMenu();
+    });
+    contEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        toggleMetricsMenu();
+      }
+    });
+  }
+  addEventListener('click', (e) => {
+    if (!e.target.closest('#metrics-menu, #st-metrics')) closeMetricsMenu();
+  });
+  addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeMetricsMenu();
+  });
+
   refreshMetrics();
   setInterval(refreshMetrics, 2500);
 }
@@ -2896,9 +3166,17 @@ function initStatusFit() {
 
 const status = $('#status');
 const statsEl = $('#sel-stats');
+// Queried rather than imported from diff.js, to keep the modules independent.
+const diffviewEl = $('#diffview');
 
 // e.code, not e.key: Option+letter types a symbol on macOS.
-const SEL_KEYS = { KeyC: 'copy-ref', KeyA: 'copy-agent', KeyU: 'usages' };
+const SEL_KEYS = { KeyC: 'copy-ref', KeyA: 'copy-agent', KeyU: 'usages', KeyE: 'agent-edit' };
+
+/* Editing lives in agent.js, which registers itself here on load. Keeping the
+   dependency one-way means selbar imports nothing back and the two never form
+   a cycle; the button simply does nothing when no harness is configured. */
+let agentHandler = null;
+function setAgentHandler(fn) { agentHandler = fn; }
 
 let current = null;   // the selection the bar is showing, or null when it is not
 let allText = null;   // Ctrl+A: promise of the S.selAll file's full text
@@ -2912,6 +3190,9 @@ function getSelectedRangeInfo() {
   if (!d) return null;
 
   const range = sel.getRangeAt(0);
+  if (diffviewEl && !diffviewEl.hidden && diffviewEl.contains(range.commonAncestorContainer)) {
+    return diffSelection(range, d);
+  }
   if (!vp.contains(range.commonAncestorContainer)) return null;
 
   const text = sel.toString().trim();
@@ -2934,13 +3215,48 @@ function getSelectedRangeInfo() {
   return { text, l1, l2, path: d.path };
 }
 
-const refOf = ({ path, l1, l2 }) => path + ':' + (l1 === l2 ? l1 : l1 + '-' + l2);
+/* A diff selection is anchored to the working-tree lines stamped on its rows,
+   on either side of a split. A selection of deleted lines alone has nothing on
+   disk, so it is anchored to the lines either side of where they were. The text
+   is gathered from the code cells alone, leaving out the line-number and +/-
+   gutters a raw selection would otherwise sweep up, and a context line showing
+   on both sides of a split is taken once. */
+function diffSelection(range, d) {
+  let l1 = Infinity, l2 = -Infinity, at1 = Infinity, at2 = -Infinity;
+  const parts = [];
+  const seen = new Set();
+  for (const el of diffviewEl.querySelectorAll('[data-l], [data-at]')) {
+    if (!range.intersectsNode(el)) continue;
+    const code = el.querySelector('.diff-code');
+    if (el.dataset.l !== undefined) {
+      const n = +el.dataset.l;
+      if (n < l1) l1 = n;
+      if (n > l2) l2 = n;
+      if (seen.has(n)) continue;
+      seen.add(n);
+    } else {
+      const n = +el.dataset.at;
+      if (n < at1) at1 = n;
+      if (n > at2) at2 = n;
+    }
+    parts.push(code ? code.textContent : '');
+  }
+  if (!parts.length) return null;
+  if (l1 === Infinity) {
+    const last = Math.max(1, d.total || 1);
+    l1 = Math.min(last, Math.max(1, at1 - 1));
+    l2 = Math.max(l1, Math.min(last, at2));
+  }
+  const text = parts.join('\n').trim();
+  if (!text) return null;
+  return { text, l1, l2, path: d.path, fromDiff: true };
+}
+
+const selectionRef = ({ path, l1, l2 }) => path + ':' + (l1 === l2 ? l1 : l1 + '-' + l2);
 
 function showSelectionBar(info) {
   current = info;
-  const ref = refOf(info);
   const lines = info.l2 - info.l1 + 1;
-  statsEl.title = ref;
   statsEl.textContent = (lines === 1 ? '1 line' : lines + ' lines') + ' · ' +
     info.text.length.toLocaleString() + ' chars';
   status.classList.add('selecting');
@@ -2948,8 +3264,10 @@ function showSelectionBar(info) {
 }
 
 function hideSelectionBar() {
+  closeSelMenu();
   if (!current) return;
   current = null;
+  if (statsEl) statsEl.textContent = '';
   status.classList.remove('selecting');
   fitStatus();
 }
@@ -3003,12 +3321,17 @@ function copySelectAll() {
 function runSelectionAction(act) {
   if (!current) return false;
   const { text, path } = current;
-  const ref = refOf(current);
+  const ref = selectionRef(current);
   if (act === 'copy-ref') {
-    copyToClipboard(ref, 'Copied ' + ref);
+    copyToClipboard(ref, 'Copied');
   } else if (act === 'copy-agent') {
     const ext = path.split('.').pop() || '';
-    copyToClipboard('### Reference: ' + ref + '\n```' + ext + '\n' + text + '\n```', 'Copied snippet for Agent (' + ref + ')');
+    const lineStr = current.l1 === current.l2 ? 'line ' + current.l1 : 'lines ' + current.l1 + '-' + current.l2;
+    const snippet = '@' + path + ' ' + lineStr + '\n```' + ext + '\n' + text + '\n```';
+    copyToClipboard(snippet, 'Copied');
+  } else if (act === 'agent-edit') {
+    if (!agentHandler) return false;
+    agentHandler(current);
   } else if (act === 'usages') {
     findReferences(text.split(/\s+/)[0] || text);
   } else {
@@ -3017,6 +3340,47 @@ function runSelectionAction(act) {
   return true;
 }
 
+/* ---------- context menu: the same actions, next to the pointer ---------- */
+
+const menu = $('#sel-menu');
+
+function closeSelMenu() {
+  if (menu && !menu.hidden) menu.hidden = true;
+}
+
+const SEL_MENU_ITEMS = [
+  { sel: 'copy-ref', label: 'Copy Ref', keys: 'Alt+C' },
+  { sel: 'copy-agent', label: 'Copy with Context', keys: 'Alt+A' },
+  { sel: 'agent-edit', label: 'Edit Inline', keys: 'Alt+E' },
+  { sel: 'usages', label: 'Find Usages', keys: 'Alt+U' },
+];
+
+/* Built from the selection actions each time, keeping Find Usages in context menu. */
+function openSelMenu(x, y) {
+  menu.replaceChildren();
+  for (const item of SEL_MENU_ITEMS) {
+    const btn = document.createElement('button');
+    btn.className = 'sel-menu-item';
+    btn.dataset.sel = item.sel;
+    btn.setAttribute('role', 'menuitem');
+    const label = document.createElement('span');
+    label.textContent = item.label;
+    btn.append(label);
+    const kbd = document.createElement('kbd');
+    kbd.className = 'footer-kbd';
+    kbd.textContent = keyLabel(item.keys);
+    btn.append(kbd);
+    menu.append(btn);
+  }
+  menu.hidden = false;
+  // Open toward the pointer's bottom-right, flipping at the window's edges.
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = Math.max(4, x + w > innerWidth - 4 ? x - w : x) + 'px';
+  menu.style.top = Math.max(4, y + h > innerHeight - 4 ? y - h : y) + 'px';
+}
+
+const bar = () => $('#footer-sel');
+
 function initSelectionBar() {
   /* Enter only once the gesture is over: swapping the footer mid-drag flickers.
      Once showing, follow the selection as it changes, and leave when it collapses
@@ -3024,21 +3388,46 @@ function initSelectionBar() {
      is released outside the viewport. */
   document.addEventListener('mouseup', () => setTimeout(updateSelectionBar, 20));
   vp.addEventListener('keyup', e => { if (e.shiftKey) setTimeout(updateSelectionBar, 20); });
-  document.addEventListener('selectionchange', () => { if (current) updateSelectionBar(); });
+  document.addEventListener('selectionchange', () => updateSelectionBar());
   // Any click ends a whole-file selection, except on the bar's buttons or a viewport scrollbar.
   document.addEventListener('mousedown', e => {
-    if (!S.selAll || e.target.closest?.('#footer-sel')) return;
+    // A right click opens the menu for the selection, so it must not end it.
+    if (!S.selAll || e.button === 2 || e.target.closest?.('#footer-sel, #sel-menu')) return;
     if (e.target === vp && (e.offsetX >= vp.clientWidth || e.offsetY >= vp.clientHeight)) return;
     clearSelectAll();
   }, true);
 
-  const bar = $('#footer-sel');
   // Pressing a button must not clear the selection it is about to act on.
-  bar.addEventListener('mousedown', e => e.preventDefault());
-  bar.addEventListener('click', e => {
-    const btn = e.target.closest('[data-sel]');
-    if (btn) runSelectionAction(btn.dataset.sel);
+  for (const el of [bar(), menu]) {
+    if (!el) continue;
+    el.addEventListener('mousedown', e => e.preventDefault());
+    el.addEventListener('click', e => {
+      const btn = e.target.closest('[data-sel]');
+      if (!btn) return;
+      closeSelMenu();
+      runSelectionAction(btn.dataset.sel);
+    });
+  }
+  if (!menu) return;
+
+  /* Only a right click on a selection is taken over. Anywhere else the browser
+     keeps its own menu, which is what a right click on plain code expects. */
+  document.addEventListener('contextmenu', e => {
+    if (menu.contains(e.target)) { e.preventDefault(); return; }
+    const inCode = vp.contains(e.target) || (diffviewEl && !diffviewEl.hidden && diffviewEl.contains(e.target));
+    if (!inCode) { closeSelMenu(); return; }
+    updateSelectionBar();
+    if (!current) { closeSelMenu(); return; }
+    e.preventDefault();
+    openSelMenu(e.clientX, e.clientY);
   });
+  document.addEventListener('mousedown', e => {
+    if (!menu.hidden && !menu.contains(e.target)) closeSelMenu();
+  }, true);
+  addEventListener('keydown', e => { if (e.key === 'Escape') closeSelMenu(); });
+  addEventListener('resize', closeSelMenu);
+  addEventListener('blur', closeSelMenu);
+  document.addEventListener('scroll', closeSelMenu, true);
 }
 
 // --- File: web/src/tabs.js ---
@@ -3070,7 +3459,7 @@ async function openFile(path, opts = {}) {
     try {
       j = await api('/api/file', { path, start, count: CHUNK });
     } catch (e) {
-      setStatusNote(path + ': ' + e.message);
+      setStatusNote(path + ': ' + e.message, 4000);
       return;
     }
     if (j.image) {
@@ -3179,7 +3568,7 @@ async function reloadOpenTabs() {
 
     if (res.status !== 'fulfilled') {
       if (idx === S.active) {
-        setStatusNote(tgt.path + ': ' + (res.reason?.message || 'failed to load'));
+        setStatusNote(tgt.path + ': ' + (res.reason?.message || 'failed to load'), 4000);
       }
       continue;
     }
@@ -3191,16 +3580,10 @@ async function reloadOpenTabs() {
     const hasDiff = !!j.diffAvailable;
     const newCur = Math.max(1, Math.min(keep.cur || 1, j.total));
 
-    let diffMode = null;
-    if (hasDiff) {
-      if (keep.diffDismissed) {
-        diffMode = null;
-      } else if (keep.diffMode) {
-        diffMode = keep.diffMode;
-      } else {
-        diffMode = layoutPref() || 'split';
-      }
-    }
+    /* A reload keeps each tab in the view it was in. The file changing under
+       it, say from an agent edit, is no reason to swap source for a diff, so a
+       tab in source is marked dismissed and loadGutter leaves it there too. */
+    const diffMode = hasDiff ? (keep.diffMode || null) : null;
 
     const d = {
       path: tgt.path,
@@ -3223,7 +3606,8 @@ async function reloadOpenTabs() {
       gutter: null,
       diffMode,
       diffAvailable: hasDiff,
-      diffDismissed: !!keep.diffDismissed,
+      diffDismissed: !!keep.diffDismissed || !keep.diffMode,
+      diffScroll: keep === activeDoc && keep.diffMode ? diffScrollTop() : 0,
     };
 
     for (let k = 0; k < j.lines.length; k++) {
@@ -3389,6 +3773,7 @@ function initTabs() {
 // adding one needs no JavaScript change. See docs/internals/styling-and-themes.md.
 
 const KEY = 'px0.theme';
+const DEFAULT_THEME = 'github-dark';
 const THEME_SELECTOR = /^(?::root|html)?\[data-theme=["']?([\w-]+)["']?\]$/;
 
 let themes = null;
@@ -3439,9 +3824,856 @@ function initTheme() {
   let saved = null;
   try { saved = localStorage.getItem(KEY); } catch {}
   if (saved && setTheme(saved, false)) return;
+  if (setTheme(DEFAULT_THEME, false)) return;
   // The attribute in index.html may name a theme that was since removed.
   const all = listThemes();
   if (all.length && !all.some(t => t.id === currentTheme())) setTheme(all[0].id, false);
+}
+
+// --- File: web/src/settings.js ---
+// web/src/settings.js
+let settingsModalEl = null;
+const BUILTIN_SCHEMA = [
+  {
+    key: "editor.fontSize",
+    title: "Font Size",
+    description: "Controls the font size in pixels for the code viewer.",
+    category: "Text Editor",
+    type: "number",
+    default: 13.5,
+    min: 9.0,
+    max: 32.0,
+    step: 0.5
+  },
+  {
+    key: "editor.fontFamily",
+    title: "Font Family",
+    description: "Controls the font family used in the code viewer.",
+    category: "Text Editor",
+    type: "string",
+    default: '"JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, Consolas, ui-monospace, monospace'
+  },
+  {
+    key: "editor.lineHeight",
+    title: "Line Height",
+    description: "Controls the line height in pixels for the code viewer.",
+    category: "Text Editor",
+    type: "number",
+    default: 21.0,
+    min: 14.0,
+    max: 48.0,
+    step: 1.0
+  },
+  {
+    key: "editor.tabSize",
+    title: "Tab Size",
+    description: "The number of spaces a tab is equal to.",
+    category: "Text Editor",
+    type: "select",
+    default: 4,
+    options: ["2", "4", "8"]
+  },
+  {
+    key: "editor.wordWrap",
+    title: "Word Wrap",
+    description: "Controls whether lines should wrap around or scroll horizontally.",
+    category: "Text Editor",
+    type: "select",
+    default: "on",
+    options: ["on", "off"]
+  },
+  {
+    key: "editor.lineNumbers",
+    title: "Line Numbers",
+    description: "Controls the display of line numbers in the gutter.",
+    category: "Text Editor",
+    type: "select",
+    default: "on",
+    options: ["on", "off"]
+  },
+  {
+    key: "editor.cursorStyle",
+    title: "Cursor Style",
+    description: "Controls the cursor style in the code viewer.",
+    category: "Text Editor",
+    type: "select",
+    default: "line",
+    options: ["line", "block", "underline"]
+  },
+  {
+    key: "editor.cursorBlinking",
+    title: "Cursor Blinking",
+    description: "Controls the cursor animation style.",
+    category: "Text Editor",
+    type: "select",
+    default: "smooth",
+    options: ["blink", "smooth", "solid"]
+  },
+  {
+    key: "editor.renderLineHighlight",
+    title: "Render Line Highlight",
+    description: "Controls how the editor should render the current line highlight.",
+    category: "Text Editor",
+    type: "select",
+    default: "line",
+    options: ["line", "none"]
+  },
+  {
+    key: "editor.occurrencesHighlight",
+    title: "Occurrences Highlight",
+    description: "Controls whether the editor should highlight occurrences of the selected word.",
+    category: "Text Editor",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "editor.scrollBeyondLastLine",
+    title: "Scroll Beyond Last Line",
+    description: "Controls whether the editor will scroll beyond the last line of the file.",
+    category: "Text Editor",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "editor.bracketPairColorization",
+    title: "Bracket Pair Colorization",
+    description: "Controls whether bracket pair colorization and matching is enabled.",
+    category: "Text Editor",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "editor.renderWhitespace",
+    title: "Render Whitespace",
+    description: "Controls how whitespace characters are rendered in the viewer.",
+    category: "Text Editor",
+    type: "select",
+    default: "selection",
+    options: ["none", "boundary", "selection", "all"]
+  },
+  {
+    key: "editor.minimap.enabled",
+    title: "Minimap Hits",
+    description: "Controls whether search hit indicators are shown in the scroll minimap gutter.",
+    category: "Text Editor",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "workbench.colorTheme",
+    title: "Color Theme",
+    description: "Specifies the color theme used in the workbench.",
+    category: "Workbench",
+    type: "select",
+    default: "github-dark",
+    options: [
+      "github-dark", "dark", "light",
+      "catppuccin-mocha", "catppuccin-latte",
+      "dracula", "gruvbox-dark", "gruvbox-light",
+      "monokai", "nord", "one-dark", "rose-pine",
+      "solarized-dark", "solarized-light"
+    ]
+  },
+  {
+    key: "diffEditor.renderSideBySide",
+    title: "Diff Side By Side",
+    description: "Controls whether the diff editor shows changes in split (side-by-side) or unified mode.",
+    category: "Workbench",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "diffEditor.ignoreTrimWhitespace",
+    title: "Diff: Ignore Trim Whitespace",
+    description: "Controls whether the diff viewer ignores changes in leading or trailing whitespace.",
+    category: "Git & Diff",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "git.gutterIndicators",
+    title: "Git Gutter Indicators",
+    description: "Controls whether changed line indicators are shown in the editor gutter.",
+    category: "Git & Diff",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "markdown.preview.open",
+    title: "Markdown Preview",
+    description: "Controls whether Markdown files open in rendered preview by default.",
+    category: "Workbench",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "explorer.compactFolders",
+    title: "Compact Folders",
+    description: "Controls whether the file tree renders single-child directory chains compactly.",
+    category: "Files & Explorer",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "explorer.autoReveal",
+    title: "Auto Reveal Active File",
+    description: "Controls whether the file explorer automatically scrolls to and reveals active tabs.",
+    category: "Files & Explorer",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "files.exclude",
+    title: "Files Exclude Patterns",
+    description: "Configure glob patterns for excluding files and folders from search and trees.",
+    category: "Files & Explorer",
+    type: "string",
+    default: "**/.git, **/node_modules, **/target, **/.DS_Store"
+  },
+  {
+    key: "search.smartCase",
+    title: "Smart Case Search",
+    description: "Searches case-insensitively when query is lowercase, and case-sensitively when uppercase characters exist.",
+    category: "Search",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "search.maxResults",
+    title: "Max Search Results",
+    description: "Controls the maximum number of results returned in workspace-wide searches.",
+    category: "Search",
+    type: "number",
+    default: 1000.0,
+    min: 50.0,
+    max: 10000.0,
+    step: 50.0
+  },
+  {
+    key: "lsp.enabled",
+    title: "Language Server Protocol (LSP)",
+    description: "Master switch for language server integrations (definitions, references, diagnostics).",
+    category: "LSP & Intelligence",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "lsp.hover.enabled",
+    title: "Hover Documentation",
+    description: "Controls whether hovercards with documentation and type signatures appear on hover.",
+    category: "LSP & Intelligence",
+    type: "boolean",
+    default: true
+  },
+  {
+    key: "agent.harness",
+    title: "Coding Harness",
+    description: "Coding agent harness invoked for code edits (e.g. claude, gemini, cursor-agent, agy, opencode, codex, aider, goose).",
+    category: "Agent / AI",
+    type: "string",
+    default: ""
+  },
+  {
+    key: "agent.timeoutSeconds",
+    title: "Agent Timeout (Seconds)",
+    description: "Controls the maximum execution time in seconds for agent edits before canceling.",
+    category: "Agent / AI",
+    type: "number",
+    default: 120.0,
+    min: 10.0,
+    max: 600.0,
+    step: 10.0
+  },
+  {
+    key: "agent.autoAcceptEdits",
+    title: "Auto Accept Agent Edits",
+    description: "Controls whether agent-generated code diffs are accepted without manual confirmation.",
+    category: "Agent / AI",
+    type: "boolean",
+    default: false
+  },
+  {
+    key: "telemetry.enabled",
+    title: "Telemetry",
+    description: "Enable anonymous usage metrics to help improve px0.",
+    category: "Security & Privacy",
+    type: "boolean",
+    default: true
+  }
+];
+
+let settingsData = {
+  settings: {},
+  defaults: Object.fromEntries(BUILTIN_SCHEMA.map(s => [s.key, s.default])),
+  schema: BUILTIN_SCHEMA,
+  raw: '{\n}\n',
+  path: '~/.px0/settings.json'
+};
+let activeSettingsCategory = 'Commonly Used';
+let settingsViewMode = 'ui'; // 'ui' | 'json'
+let settingsFilterQuery = '';
+
+const COMMONLY_USED_KEYS = new Set([
+  'editor.fontSize',
+  'workbench.colorTheme',
+  'editor.wordWrap',
+  'editor.lineNumbers',
+  'editor.tabSize',
+  'diffEditor.renderSideBySide',
+  'editor.cursorStyle',
+  'explorer.autoReveal',
+  'search.smartCase',
+  'lsp.hover.enabled',
+  'agent.harness',
+]);
+
+async function loadSettings() {
+  try {
+    const data = await api('/api/settings');
+    if (data && data.schema && data.schema.length > 0) {
+      settingsData = data;
+    } else if (data) {
+      settingsData.settings = data.settings || {};
+      settingsData.raw = data.raw || settingsData.raw;
+      settingsData.path = data.path || settingsData.path;
+      if (data.defaults) settingsData.defaults = { ...settingsData.defaults, ...data.defaults };
+    }
+    S.settings = settingsData.settings || {};
+    return settingsData;
+  } catch (err) {
+    console.warn('Using built-in settings schema (offline/fallback):', err);
+    return settingsData;
+  }
+}
+
+function applySettingLive(key, val) {
+  if (!S.settings) S.settings = {};
+  S.settings[key] = val;
+
+  switch (key) {
+    case 'editor.fontSize':
+    case 'editor.fontFamily':
+    case 'editor.lineHeight':
+    case 'editor.tabSize': {
+      const fs = parseFloat(S.settings['editor.fontSize']) || 13.5;
+      const ff = S.settings['editor.fontFamily'] || '';
+      const lh = parseFloat(S.settings['editor.lineHeight']) || 21.0;
+      const ts = parseInt(S.settings['editor.tabSize'], 10) || 4;
+      applyEditorTypography(fs, ff, lh, ts);
+      break;
+    }
+    case 'editor.wordWrap': {
+      const on = val === 'on' || val === true;
+      toggleWordWrap(on);
+      break;
+    }
+    case 'editor.lineNumbers': {
+      const on = val === 'on' || val === true;
+      toggleLineNumbers(on);
+      break;
+    }
+    case 'editor.cursorStyle': {
+      document.body.classList.remove('cursor-block', 'cursor-underline');
+      if (val === 'block') document.body.classList.add('cursor-block');
+      else if (val === 'underline') document.body.classList.add('cursor-underline');
+      break;
+    }
+    case 'editor.cursorBlinking': {
+      document.body.classList.remove('cursor-blink-smooth', 'cursor-blink-solid', 'cursor-blink-blink');
+      if (val === 'solid') document.body.classList.add('cursor-blink-solid');
+      else if (val === 'blink') document.body.classList.add('cursor-blink-blink');
+      else document.body.classList.add('cursor-blink-smooth');
+      break;
+    }
+    case 'editor.renderLineHighlight': {
+      document.body.classList.toggle('no-line-highlight', val === 'none');
+      break;
+    }
+    case 'editor.scrollBeyondLastLine': {
+      document.body.classList.toggle('no-scroll-beyond', val === false || val === 'false');
+      break;
+    }
+    case 'git.gutterIndicators': {
+      document.body.classList.toggle('hide-git-gutter', val === false || val === 'false');
+      break;
+    }
+    case 'editor.minimap.enabled': {
+      const minimap = $('#minimap-hits');
+      if (minimap) minimap.style.display = (val === false || val === 'false') ? 'none' : '';
+      break;
+    }
+    case 'workbench.colorTheme': {
+      if (val) setTheme(val, true);
+      break;
+    }
+    case 'diffEditor.renderSideBySide': {
+      const split = val === true || val === 'true';
+      setLayoutPref(split ? 'split' : 'unified');
+      break;
+    }
+    case 'markdown.preview.open': {
+      S.mdPreview = val === true || val === 'true';
+      try { localStorage.setItem('px0.mdPreview', S.mdPreview ? 'true' : 'false'); } catch {}
+      break;
+    }
+  }
+}
+
+function applyAllSettingsLive() {
+  if (!S.settings) return;
+  for (const [k, v] of Object.entries(S.settings)) {
+    applySettingLive(k, v);
+  }
+}
+
+function openSettings(mode = 'ui') {
+  if (!settingsModalEl) initSettingsDOM();
+  settingsViewMode = mode === 'json' ? 'json' : 'ui';
+  settingsModalEl.hidden = false;
+
+  // Immediately render with current schema & settings
+  updateSettingsHeader();
+  if (settingsViewMode === 'json') {
+    showSettingsJSONView();
+  } else {
+    showSettingsUIView();
+  }
+
+  // Refresh with latest settings from server
+  loadSettings().then(() => {
+    updateSettingsHeader();
+    if (settingsViewMode === 'json') {
+      showSettingsJSONView();
+    } else {
+      showSettingsUIView();
+    }
+  });
+
+  const searchInput = $('#settings-search');
+  if (searchInput && settingsViewMode === 'ui') {
+    setTimeout(() => searchInput.focus(), 50);
+  }
+}
+
+function closeSettings() {
+  if (settingsModalEl) settingsModalEl.hidden = true;
+}
+
+function isSettingsOpen() {
+  return settingsModalEl && !settingsModalEl.hidden;
+}
+
+function updateSettingsHeader() {
+  const pathEl = $('#settings-path');
+  if (pathEl && settingsData.path) {
+    pathEl.textContent = settingsData.path;
+    pathEl.title = 'Click to copy path: ' + settingsData.path;
+  }
+  const btnUI = $('#settings-mode-ui');
+  const btnJSON = $('#settings-mode-json');
+  if (btnUI && btnJSON) {
+    btnUI.classList.toggle('active', settingsViewMode === 'ui');
+    btnJSON.classList.toggle('active', settingsViewMode === 'json');
+  }
+}
+
+function showSettingsUIView() {
+  settingsViewMode = 'ui';
+  updateSettingsHeader();
+  $('#settings-ui-container').hidden = false;
+  $('#settings-json-container').hidden = true;
+  $('#settings-search-bar').hidden = false;
+  renderSettingsNav();
+  renderSettingsList();
+}
+
+function showSettingsJSONView() {
+  settingsViewMode = 'json';
+  updateSettingsHeader();
+  $('#settings-ui-container').hidden = true;
+  $('#settings-json-container').hidden = false;
+  $('#settings-search-bar').hidden = true;
+
+  const rawEditor = $('#settings-raw-editor');
+  if (rawEditor) {
+    rawEditor.value = settingsData.raw || '{\n}\n';
+    rawEditor.focus();
+  }
+  const errEl = $('#settings-raw-error');
+  if (errEl) errEl.hidden = true;
+}
+
+function getSettingCategories() {
+  const cats = ['Commonly Used'];
+  const seen = new Set(cats);
+  for (const item of (settingsData.schema || [])) {
+    const cat = item.category || item.Category;
+    if (cat && !seen.has(cat)) {
+      cats.push(cat);
+      seen.add(cat);
+    }
+  }
+  return cats;
+}
+
+function renderSettingsNav() {
+  const nav = $('#settings-nav');
+  if (!nav) return;
+  const cats = getSettingCategories();
+  nav.innerHTML = cats.map(cat => {
+    const active = cat === activeSettingsCategory ? ' active' : '';
+    return `<button class="settings-nav-item${active}" data-cat="${esc(cat)}">${esc(cat)}</button>`;
+  }).join('');
+}
+
+function isSettingModified(key, val, defVal) {
+  if (val === undefined || val === null) return false;
+  if (defVal === undefined || defVal === null) return val !== '';
+  if (typeof defVal === 'number') {
+    return parseFloat(val) !== parseFloat(defVal);
+  }
+  if (typeof defVal === 'boolean') {
+    return Boolean(val) !== Boolean(defVal);
+  }
+  return String(val) !== String(defVal);
+}
+
+function renderSettingsList() {
+  const container = $('#settings-list');
+  if (!container) return;
+
+  const q = settingsFilterQuery.trim().toLowerCase();
+  const schema = settingsData.schema || [];
+  const currentSettings = settingsData.settings || {};
+  const defaults = settingsData.defaults || {};
+
+  let items = schema;
+  if (q) {
+    items = schema.filter(s => {
+      const title = (s.title || s.Title || '').toLowerCase();
+      const key = (s.key || s.Key || '').toLowerCase();
+      const desc = (s.description || s.Description || '').toLowerCase();
+      const cat = (s.category || s.Category || '').toLowerCase();
+      return title.includes(q) || key.includes(q) || desc.includes(q) || cat.includes(q);
+    });
+  } else if (activeSettingsCategory === 'Commonly Used') {
+    items = schema.filter(s => COMMONLY_USED_KEYS.has(s.key || s.Key));
+  } else {
+    items = schema.filter(s => (s.category || s.Category) === activeSettingsCategory);
+  }
+
+  if (items.length === 0) {
+    container.innerHTML = `<div class="settings-empty">No matching settings found for "${esc(q || activeSettingsCategory)}".</div>`;
+    return;
+  }
+
+  const html = items.map(item => {
+    const key = item.key || item.Key;
+    const title = item.title || item.Title || key;
+    const desc = item.description || item.Description || '';
+    const cat = item.category || item.Category || 'General';
+    const type = item.type || item.Type || 'string';
+    const itemDef = item.default !== undefined ? item.default : item.Default;
+    const def = defaults[key] !== undefined ? defaults[key] : itemDef;
+    const val = currentSettings[key] !== undefined ? currentSettings[key] : def;
+    const modified = isSettingModified(key, currentSettings[key], def);
+    const modClass = modified ? ' is-modified' : '';
+
+    let controlHtml = '';
+    let aptValuesHtml = '';
+
+    if (type === 'boolean') {
+      const checked = (val === true || val === 'true') ? 'checked' : '';
+      controlHtml = `
+        <label class="settings-switch">
+          <input type="checkbox" data-key="${esc(key)}" ${checked}>
+          <span class="settings-slider"></span>
+        </label>`;
+      const isT = val === true || val === 'true';
+      aptValuesHtml = `
+        <div class="settings-apt-bar">
+          <span class="settings-apt-label">Allowed Values:</span>
+          <div class="settings-apt-pills">
+            <button type="button" class="settings-pill-tag${isT ? ' active' : ''}" data-set-key="${esc(key)}" data-set-val="true" title="Set to true">true</button>
+            <button type="button" class="settings-pill-tag${!isT ? ' active' : ''}" data-set-key="${esc(key)}" data-set-val="false" title="Set to false">false</button>
+          </div>
+        </div>`;
+    } else if (type === 'select') {
+      const opts = item.options || item.Options || [];
+      const optHtml = opts.map(o => {
+        const sel = String(o) === String(val) ? 'selected' : '';
+        return `<option value="${esc(o)}" ${sel}>${esc(o)}</option>`;
+      }).join('');
+      controlHtml = `<select class="settings-select" data-key="${esc(key)}">${optHtml}</select>`;
+      const pills = opts.map(o => {
+        const isSel = String(o) === String(val);
+        return `<button type="button" class="settings-pill-tag${isSel ? ' active' : ''}" data-set-key="${esc(key)}" data-set-val="${esc(String(o))}" title="Select ${esc(String(o))}">${esc(String(o))}</button>`;
+      }).join('');
+      aptValuesHtml = `
+        <div class="settings-apt-bar">
+          <span class="settings-apt-label">Options:</span>
+          <div class="settings-apt-pills">
+            ${pills}
+          </div>
+        </div>`;
+    } else if (type === 'number') {
+      const min = item.min !== undefined ? item.min : item.Min;
+      const max = item.max !== undefined ? item.max : item.Max;
+      const step = item.step !== undefined ? item.step : item.Step;
+      const minAttr = min !== undefined ? `min="${min}"` : '';
+      const maxAttr = max !== undefined ? `max="${max}"` : '';
+      const stepAttr = step !== undefined ? `step="${step}"` : 'step="1"';
+      controlHtml = `<input type="number" class="settings-input settings-input-num" data-key="${esc(key)}" value="${esc(String(val))}" ${minAttr} ${maxAttr} ${stepAttr}>`;
+
+      let numberPresets = [];
+      if (key === 'editor.fontSize') numberPresets = [12, 13, 13.5, 14, 16, 18];
+      else if (key === 'editor.lineHeight') numberPresets = [18, 20, 21, 24, 28];
+      else if (key === 'search.maxResults') numberPresets = [200, 500, 1000, 5000];
+      else if (key === 'agent.timeoutSeconds') numberPresets = [60, 120, 180, 300];
+
+      const presetPills = numberPresets.length ? `
+        <span class="settings-apt-label">Presets:</span>
+        <div class="settings-apt-pills">
+          ${numberPresets.map(n => {
+            const isSel = Number(val) === n;
+            return `<button type="button" class="settings-pill-tag${isSel ? ' active' : ''}" data-set-key="${esc(key)}" data-set-val="${n}">${n}</button>`;
+          }).join('')}
+        </div>` : '';
+
+      aptValuesHtml = `
+        <div class="settings-apt-bar">
+          <span class="settings-tag tag-range">Min: <b>${min !== undefined ? min : '—'}</b></span>
+          <span class="settings-tag tag-range">Max: <b>${max !== undefined ? max : '—'}</b></span>
+          ${step !== undefined ? `<span class="settings-tag tag-step">Step: <b>${step}</b></span>` : ''}
+          ${presetPills}
+        </div>`;
+    } else {
+      controlHtml = `<input type="text" class="settings-input" data-key="${esc(key)}" value="${esc(String(val || ''))}">`;
+      let stringPresets = [];
+      if (key === 'agent.harness') {
+        stringPresets = ['claude', 'gemini', 'cursor-agent', 'agy', 'aider'];
+      }
+      const presetPills = stringPresets.length ? `
+        <div class="settings-apt-bar">
+          <span class="settings-apt-label">Suggestions:</span>
+          <div class="settings-apt-pills">
+            ${stringPresets.map(s => {
+              const isSel = String(val) === s;
+              return `<button type="button" class="settings-pill-tag${isSel ? ' active' : ''}" data-set-key="${esc(key)}" data-set-val="${esc(s)}">${esc(s)}</button>`;
+            }).join('')}
+          </div>
+        </div>` : '';
+
+      aptValuesHtml = presetPills;
+    }
+
+    const resetBtn = modified
+      ? `<button class="settings-reset-btn" data-reset="${esc(key)}" title="Reset to default (${esc(String(def))})">Reset</button>`
+      : '';
+
+    return `
+      <div class="settings-card${modClass}" data-setting="${esc(key)}">
+        <div class="settings-card-left">
+          <div class="settings-card-header">
+            <span class="settings-card-title">${esc(title)}</span>
+            <span class="settings-card-key">${esc(key)}</span>
+            <span class="settings-tag tag-cat">${esc(cat)}</span>
+            <span class="settings-tag tag-type">${esc(type)}</span>
+          </div>
+          <div class="settings-card-desc">${esc(desc)}</div>
+          ${aptValuesHtml}
+          <div class="settings-card-meta">
+            <span class="settings-tag tag-current">Current: <b>${esc(String(val))}</b></span>
+            <span class="settings-tag tag-default">Default: <code>${esc(String(def))}</code></span>
+            ${modified ? `<span class="settings-tag tag-modified">Modified</span>` : ''}
+            ${resetBtn}
+          </div>
+        </div>
+        <div class="settings-card-right">
+          ${controlHtml}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = html;
+}
+
+async function handleSettingChange(key, value) {
+  // Update state locally
+  if (!settingsData.settings) settingsData.settings = {};
+  settingsData.settings[key] = value;
+  applySettingLive(key, value);
+
+  // Re-render setting card modified state
+  renderSettingsList();
+
+  // Persist to server
+  try {
+    const res = await apiPost('/api/settings', { [key]: value });
+    if (res.raw) settingsData.raw = res.raw;
+  } catch (err) {
+    console.error(`Failed to save setting ${key}:`, err);
+  }
+}
+
+async function handleResetSetting(key) {
+  const def = settingsData.defaults ? settingsData.defaults[key] : undefined;
+  if (def !== undefined) {
+    await handleSettingChange(key, def);
+  }
+}
+
+async function handleSaveRawSettings() {
+  const rawEditor = $('#settings-raw-editor');
+  const errEl = $('#settings-raw-error');
+  if (!rawEditor) return;
+
+  const rawText = rawEditor.value;
+  try {
+    JSON.parse(rawText);
+    if (errEl) errEl.hidden = true;
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = 'JSON Syntax Error: ' + err.message;
+      errEl.hidden = false;
+    }
+    return;
+  }
+
+  try {
+    const res = await apiPost('/api/settings', { raw: rawText });
+    if (res.settings) {
+      settingsData.settings = res.settings;
+      S.settings = res.settings;
+      applyAllSettingsLive();
+    }
+    if (res.raw) settingsData.raw = res.raw;
+    if (errEl) {
+      errEl.textContent = 'Settings saved successfully.';
+      errEl.hidden = false;
+      errEl.classList.add('success');
+      setTimeout(() => {
+        errEl.hidden = true;
+        errEl.classList.remove('success');
+      }, 2500);
+    }
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = 'Failed to save: ' + err.message;
+      errEl.hidden = false;
+    }
+  }
+}
+
+function initSettingsDOM() {
+  settingsModalEl = $('#settings-modal');
+  if (!settingsModalEl) return;
+
+  // Header close button
+  $('#settings-close')?.addEventListener('click', closeSettings);
+
+  // Click outside dialog to close
+  settingsModalEl.addEventListener('click', e => {
+    if (e.target === settingsModalEl) closeSettings();
+  });
+
+  // Switch between UI and JSON mode
+  $('#settings-mode-ui')?.addEventListener('click', () => showSettingsUIView());
+  $('#settings-mode-json')?.addEventListener('click', () => showSettingsJSONView());
+
+  // Copy path to clipboard
+  $('#settings-path')?.addEventListener('click', () => {
+    if (settingsData.path) {
+      navigator.clipboard.writeText(settingsData.path);
+      const toast = $('#toast');
+      if (toast) {
+        toast.textContent = 'Copied settings path to clipboard';
+        toast.hidden = false;
+        setTimeout(() => { toast.hidden = true; }, 2000);
+      }
+    }
+  });
+
+  // Search filter
+  const searchInput = $('#settings-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', e => {
+      settingsFilterQuery = e.target.value;
+      renderSettingsList();
+    });
+    $('#settings-search-clear')?.addEventListener('click', () => {
+      searchInput.value = '';
+      settingsFilterQuery = '';
+      renderSettingsList();
+      searchInput.focus();
+    });
+  }
+
+  // Nav categories
+  $('#settings-nav')?.addEventListener('click', e => {
+    const btn = e.target.closest('.settings-nav-item');
+    if (!btn) return;
+    activeSettingsCategory = btn.dataset.cat;
+    settingsFilterQuery = '';
+    if (searchInput) searchInput.value = '';
+    renderSettingsNav();
+    renderSettingsList();
+  });
+
+  // Settings list events (controls & reset buttons)
+  const listEl = $('#settings-list');
+  if (listEl) {
+    listEl.addEventListener('change', e => {
+      const target = e.target;
+      const key = target.dataset.key;
+      if (!key) return;
+
+      let value;
+      if (target.type === 'checkbox') {
+        value = target.checked;
+      } else if (target.type === 'number') {
+        value = parseFloat(target.value);
+      } else {
+        value = target.value;
+      }
+      handleSettingChange(key, value);
+    });
+
+    listEl.addEventListener('click', e => {
+      const pill = e.target.closest('.settings-pill-tag');
+      if (pill) {
+        const key = pill.dataset.setKey;
+        let value = pill.dataset.setVal;
+        if (value === 'true') value = true;
+        else if (value === 'false') value = false;
+        else if (!isNaN(Number(value)) && value.trim() !== '') value = Number(value);
+        if (key) handleSettingChange(key, value);
+        return;
+      }
+      const resetBtn = e.target.closest('.settings-reset-btn');
+      if (resetBtn) {
+        const key = resetBtn.dataset.reset;
+        if (key) handleResetSetting(key);
+      }
+    });
+  }
+
+  // JSON Raw view buttons
+  $('#btn-settings-save-raw')?.addEventListener('click', handleSaveRawSettings);
+  $('#btn-settings-reset-raw')?.addEventListener('click', () => {
+    const rawEditor = $('#settings-raw-editor');
+    if (rawEditor) rawEditor.value = settingsData.raw || '{\n}\n';
+    const errEl = $('#settings-raw-error');
+    if (errEl) errEl.hidden = true;
+  });
+}
+
+function initSettings() {
+  initSettingsDOM();
+  loadSettings().then(() => {
+    applyAllSettingsLive();
+  });
 }
 
 // --- File: web/src/shortcuts.js ---
@@ -3462,10 +4694,12 @@ function initTheme() {
 
 
 
+
 /* Each entry lists alternative combos, written as for keyLabel in state.js so
    they show as ⌘/⌥/⇧ on a Mac and Ctrl/Alt/Shift elsewhere. Browsers keep
    Ctrl+W and Cmd+W for themselves, so Alt+W is the close shortcut shown. */
 const SHORTCUTS = [
+  [['Mod+,'], 'Open settings'],
   [['Mod+K'], 'Quick search / palette'], [['Mod+P'], 'Go to file'],
   [['Mod+Shift+P'], 'Command palette'], [['Mod+Shift+O'], 'Go to symbol'],
   [['Mod+Shift+F'], 'Search in files'], [['Mod+F'], 'Find in file'],
@@ -3479,7 +4713,9 @@ const SHORTCUTS = [
   [['Alt+W'], 'Close tab'], [['Alt+Shift+T'], 'Reopen closed tab'], [['Ctrl+Tab'], 'Next tab'],
   [['Alt+1…9'], 'Select tab'], [['Double click'], 'Highlight all occurrences'],
   [['Mod+A'], 'Select whole file'],
-  [['Alt+C', 'Alt+A'], 'Copy selection ref / for agent'], [['Alt+U'], 'Find usages of selection'],
+  [['Alt+C', 'Alt+A'], 'Copy selection ref / with context'], [['Alt+U'], 'Find usages of selection'],
+  [['Alt+E'], 'Edit selection inline'],
+  [['Right click'], 'Selection actions at the pointer'],
   [['Mod+Home|Mod+Up', 'Mod+End|Mod+Down'], 'Top / bottom of file'],
   [['Home|Mod+Left', 'End|Mod+Right'], 'Start / end of line'],
   [['Left', 'Right'], 'Move caret along the line'],
@@ -3499,6 +4735,7 @@ const inField = el => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
 
 function initShortcuts() {
   $('#btn-theme')?.addEventListener('click', cycleTheme);
+  $('#btn-settings')?.addEventListener('click', () => openSettings('ui'));
   $('#btn-help')?.addEventListener('click', showHelp);
   $('#st-ver')?.addEventListener('click', showHelp);
   $('#helpsheet').addEventListener('click', () => { $('#helpsheet').hidden = true; });
@@ -3514,9 +4751,9 @@ function initShortcuts() {
     else if (act === 'find') openFind(S.lastWord);
     else if (act === 'goto') openPalette('line');
     else if (act === 'wrap') toggleWordWrap();
-    else if (act === 'line-numbers') toggleLineNumbers();
     else if (act === 'md-preview') togglePreview();
     else if (act === 'palette') openPalette('command');
+    else if (act === 'settings') openSettings('ui');
     else if (act === 'help') showHelp();
   });
 
@@ -3524,6 +4761,7 @@ function initShortcuts() {
     const mod = e[MOD];
 
     if (e.key === 'Escape') {
+      if (isSettingsOpen()) { closeSettings(); return; }
       if (!overlay.hidden) { closePalette(); return; }
       if (!$('#helpsheet').hidden) { $('#helpsheet').hidden = true; return; }
       if (!hovercard.hidden) { clearLink(); return; }
@@ -3532,6 +4770,12 @@ function initShortcuts() {
       if (!document.body.classList.contains('right-hidden')) { hideRightInspector(); return; }
       if (S.occ) { S.occ = null; paint(); return; }
       if (inField(document.activeElement)) document.activeElement.blur();
+      return;
+    }
+
+    if (mod && (e.key === ',' || e.key === '<')) {
+      e.preventDefault();
+      openSettings('ui');
       return;
     }
 
@@ -3599,12 +4843,6 @@ function initShortcuts() {
       return;
     }
 
-    if (e.altKey && e.code === 'KeyL') {
-      e.preventDefault();
-      toggleLineNumbers();
-      return;
-    }
-
     if (e.altKey && !mod && !e.shiftKey && e.code === 'KeyM') {
       e.preventDefault();
       togglePreview();
@@ -3624,19 +4862,22 @@ function initShortcuts() {
     if (previewing(d)) { if (previewKey(e)) e.preventDefault(); return; }
     const toTop = () => { vp.scrollTop = 0; d.cur = 1; render(); updateStatus(); };
     const toBottom = () => { vp.scrollTop = sizer.offsetHeight; d.cur = d.total; render(); updateStatus(); };
-    if (mod && e.key === 'Home') { e.preventDefault(); toTop(); return; }
-    if (mod && e.key === 'End') { e.preventDefault(); toBottom(); return; }
+    const shift = e.shiftKey;
+    if (mod && e.key === 'Home') { e.preventDefault(); if (shift) caretToEdge(false, true); else toTop(); return; }
+    if (mod && e.key === 'End') { e.preventDefault(); if (shift) caretToEdge(true, true); else toBottom(); return; }
     // A Mac keyboard has no Home or End: Cmd with the arrows does their job there.
     if (isMac && mod && e.key === 'ArrowUp') { e.preventDefault(); toTop(); return; }
     if (isMac && mod && e.key === 'ArrowDown') { e.preventDefault(); toBottom(); return; }
-    if (isMac && mod && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); caretToEdge(e.key === 'ArrowRight'); return; }
-    if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); moveCursor(1); return; }
-    if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); moveCursor(-1); return; }
-    if (!mod && !e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); moveCol(-1); return; }
-    if (!mod && !e.altKey && e.key === 'ArrowRight') { e.preventDefault(); moveCol(1); return; }
-    if (!mod && (e.key === 'Home' || e.key === 'End')) { e.preventDefault(); caretToEdge(e.key === 'End'); return; }
-    if (e.key === 'PageDown') { e.preventDefault(); moveCursor(Math.floor(vp.clientHeight / LH) - 2); return; }
-    if (e.key === 'PageUp') { e.preventDefault(); moveCursor(-(Math.floor(vp.clientHeight / LH) - 2)); return; }
+    if (isMac && mod && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); caretToEdge(e.key === 'ArrowRight', shift); return; }
+    if (mod && !isMac && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); moveWord(e.key === 'ArrowRight' ? 1 : -1, shift); return; }
+    if (isMac && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); moveWord(e.key === 'ArrowRight' ? 1 : -1, shift); return; }
+    if (!mod && (e.key === 'ArrowDown' || e.key === 'j')) { e.preventDefault(); moveCursor(1, shift); return; }
+    if (!mod && (e.key === 'ArrowUp' || e.key === 'k')) { e.preventDefault(); moveCursor(-1, shift); return; }
+    if (!mod && !e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); moveCol(-1, shift); return; }
+    if (!mod && !e.altKey && e.key === 'ArrowRight') { e.preventDefault(); moveCol(1, shift); return; }
+    if (!mod && (e.key === 'Home' || e.key === 'End')) { e.preventDefault(); caretToEdge(e.key === 'End', shift); return; }
+    if (e.key === 'PageDown') { e.preventDefault(); moveCursor(Math.floor(vp.clientHeight / LH) - 2, shift); return; }
+    if (e.key === 'PageUp') { e.preventDefault(); moveCursor(-(Math.floor(vp.clientHeight / LH) - 2), shift); return; }
   }, { capture: true });
 
 
@@ -3649,6 +4890,8 @@ const palInput = $('#pal');
 const palList = $('#pal-list');
 let pal = null;
 const COMMANDS = [
+  { name: withKeys('Preferences: Open Settings (UI) ({Mod+,})'), run: () => openSettings('ui') },
+  { name: 'Preferences: Open Settings (JSON)', run: () => openSettings('json') },
   { name: 'Go to File…', run: () => openPalette('file') },
   { name: 'Go to Symbol in File…', run: () => openPalette('symbol') },
   { name: 'Go to Line…', run: () => openPalette('line') },
@@ -3808,8 +5051,560 @@ function initPalette() {
   overlay.addEventListener('mousedown', e => { if (e.target === overlay) closePalette(); });
 }
 
+// --- File: web/src/agent.js ---
+// web/src/agent.js
+
+
+
+
+
+
+
+
+/* px0 does not author edits. Each box composes an instruction and the range it
+   is anchored to, hands both to a coding harness on this machine, and reloads
+   whatever moved once that harness exits. Because px0 dispatched the run it
+   knows when the work ended, so nothing here watches the filesystem.
+
+   Several edits can run at once, one box per range: two harnesses rewriting
+   the same lines would produce a result nobody could review, so a range that
+   overlaps one already open is refused before it ever reaches the server
+   (which enforces the same rule for a race between two tabs).
+
+   Harnesses are detected, not configured: the picker lists what is installed
+   and the choice is remembered in the settings file. Detecting one is never
+   enough to run it, so the first edit in a fresh install asks which to use. */
+
+const box = $('#agentbox');
+const tpl = $('#agentbox-tpl');
+
+const sessions = new Map(); // local session id -> in-progress compose/edit
+let agentSeq = 0;
+
+const installed = () => (S.meta?.agents || []).filter(h => h.installed);
+const chosen = () => (S.meta && S.meta.agent) || '';
+const chosenModel = () => (S.meta && S.meta.agentModel) || '';
+const targetRef = ({ path, l1, l2 }) => path + ':' + (l1 === l2 ? l1 : l1 + '-' + l2);
+const rangesOverlap = (a, b) => a.path === b.path && a.l1 <= b.l2 && b.l1 <= a.l2;
+
+function applyAgentMeta() {
+  for (const session of sessions.values()) {
+    updateSessionMeta(session);
+  }
+}
+
+function updateSessionMeta(session) {
+  if (!session.harnessSelect || !session.modelSelect) return;
+  const ready = (S.meta?.agents || []).filter(h => h.installed);
+  const currentHarness = chosen();
+  const currentModel = chosenModel();
+
+  // Populate harness select
+  session.harnessSelect.innerHTML = '';
+  if (!ready.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'no harness';
+    session.harnessSelect.appendChild(opt);
+    session.harnessSelect.disabled = true;
+    session.modelSelect.innerHTML = '';
+    session.modelSelect.hidden = true;
+    return;
+  }
+
+  for (const h of ready) {
+    const opt = document.createElement('option');
+    opt.value = h.name;
+    opt.textContent = h.name;
+    if (h.name === currentHarness) opt.selected = true;
+    session.harnessSelect.appendChild(opt);
+  }
+  const isBusy = session.el.classList.contains('busy');
+  session.harnessSelect.disabled = isBusy || !!(S.meta && S.meta.agentPinned);
+  session.harnessSelect.title = S.meta && S.meta.agentPinned
+    ? 'Fixed for this run by -agent'
+    : 'Change the coding harness';
+
+  // Populate model select for the currently selected harness
+  const activeH = ready.find(h => h.name === (session.harnessSelect.value || currentHarness)) || ready[0];
+  session.modelSelect.innerHTML = '';
+  const models = activeH?.models || [];
+  if (models.length > 0) {
+    for (const m of models) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      if (m === currentModel) opt.selected = true;
+      session.modelSelect.appendChild(opt);
+    }
+    session.modelSelect.hidden = false;
+    session.modelSelect.disabled = isBusy;
+    session.modelSelect.title = 'Model for ' + activeH.name;
+  } else {
+    session.modelSelect.hidden = true;
+  }
+}
+
+// Loads harnesses and models asynchronously after the browser UI has loaded.
+async function loadAgentAsync() {
+  try {
+    const j = await api('/api/agent/harnesses');
+    S.meta.agents = j.harnesses || [];
+    S.meta.agent = j.selected || S.meta.agent || '';
+    S.meta.agentModel = j.model || S.meta.agentModel || '';
+    S.meta.agentPinned = !!j.pinned;
+    applyAgentMeta();
+  } catch {}
+}
+
+function anyInFlight() {
+  for (const s of sessions.values()) if (s.timer) return true;
+  return false;
+}
+
+function syncBoxVisibility() {
+  box.hidden = sessions.size === 0;
+}
+
+function openAgentEdit(info) {
+  if (!info) return;
+  for (const s of sessions.values()) {
+    if (rangesOverlap(s.target, info)) {
+      showToast('!', 'Overlaps the edit already open on ' + targetRef(s.target));
+      return;
+    }
+  }
+  const session = createSession(info);
+  sessions.set(session.id, session);
+  syncAgentTargets();
+  applyAgentMeta();
+  syncBoxVisibility();
+  if (chosen() && installed().some(h => h.name === chosen())) {
+    showCompose(session);
+  } else {
+    showPicker(session);
+  }
+}
+
+function syncAgentTargets() {
+  S.agentTargets = [...sessions.values()].map(s => ({
+    id: s.id,
+    path: s.target.path,
+    l1: s.target.l1,
+    l2: s.target.l2,
+  }));
+  render();
+  syncDiffAgentTargets();
+}
+
+function createSession(info) {
+  const el = tpl.content.firstElementChild.cloneNode(true);
+  // Newest first in markup: #agentbox is column-reverse, so it lands closest
+  // to the corner the stack grows from, where a triggered action was aimed.
+  box.prepend(el);
+  const session = {
+    id: ++agentSeq,
+    target: info,
+    timer: null,
+    jobId: null,
+    harness: '',
+    el,
+    refEl: el.querySelector('.agent-ref'),
+    metaEl: el.querySelector('.agent-meta'),
+    harnessSelect: el.querySelector('.agent-harness-select'),
+    modelSelect: el.querySelector('.agent-model-select'),
+    closeBtn: el.querySelector('.agent-close'),
+    pickEl: el.querySelector('.agent-pick'),
+    composeEl: el.querySelector('.agent-compose'),
+    input: el.querySelector('.agent-input'),
+    sendBtn: el.querySelector('.agent-send'),
+    cancelBtn: el.querySelector('.agent-cancel'),
+    hintEl: el.querySelector('.agent-hint'),
+    errEl: el.querySelector('.agent-err'),
+  };
+  wireSession(session);
+  refreshRef(session);
+  setBusy(session, false);
+  resetHint(session);
+  clearErr(session);
+  session.input.value = '';
+  session.input.focus();
+  return session;
+}
+
+function wireSession(session) {
+  session.sendBtn.addEventListener('click', () => submit(session));
+  session.cancelBtn?.addEventListener('click', () => cancelSession(session));
+  session.closeBtn.addEventListener('click', () => closeAgentEdit(session));
+  if (session.harnessSelect) {
+    session.harnessSelect.addEventListener('change', async () => {
+      const hName = session.harnessSelect.value;
+      if (!hName) return;
+      await select(hName, msg => showErr(session, msg));
+      session.input.focus();
+    });
+  }
+  if (session.modelSelect) {
+    session.modelSelect.addEventListener('change', async () => {
+      const hName = session.harnessSelect?.value || chosen();
+      const mName = session.modelSelect.value;
+      await select(hName, mName, msg => showErr(session, msg));
+      session.input.focus();
+    });
+  }
+  /* The composer swallows every key while it is open. Nothing typed into an
+     instruction should also fire a viewport shortcut. */
+  session.el.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (session.timer || session.jobId) {
+        cancelSession(session);
+      } else {
+        closeAgentEdit(session);
+      }
+    } else if (e.key === 'Enter' && !e.shiftKey && !session.composeEl.hidden && !session.timer) {
+      e.preventDefault();
+      submit(session);
+    }
+  });
+}
+
+async function cancelSession(session) {
+  if (!session.timer && !session.jobId) return;
+  if (session.timer) {
+    clearTimeout(session.timer);
+    session.timer = null;
+  }
+  const jobId = session.jobId;
+  session.jobId = null;
+  setBusy(session, false);
+  resetHint(session);
+  refreshStatusNote();
+  showToast('!', 'Cancelled edit on ' + targetRef(session.target));
+  if (jobId) {
+    try {
+      await apiPost('/api/agent/cancel', { id: jobId });
+    } catch {}
+  }
+  session.input.focus();
+}
+
+function closeAgentEdit(session) {
+  if (session.timer || session.jobId) {
+    cancelSession(session);
+  }
+  sessions.delete(session.id);
+  session.el.remove();
+  syncBoxVisibility();
+  syncAgentTargets();
+}
+
+function refreshRef(session) {
+  const ref = targetRef(session.target);
+  session.refEl.textContent = ref;
+  session.refEl.title = ref;
+}
+
+function clearErr(session) {
+  const errEl = session.errEl;
+  if (!errEl) return;
+  errEl.textContent = '';
+  errEl.hidden = true;
+}
+
+/* Renders a failure inline under the instruction. A harness run also carries
+   what it printed, which is usually the only clue to why it exited non-zero. */
+function showErr(session, msg, streams = []) {
+  const errEl = session.errEl;
+  if (!errEl) return;
+  errEl.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'agent-err-msg';
+  head.textContent = msg;
+  errEl.appendChild(head);
+  for (const [label, text] of streams) {
+    if (!text) continue;
+    const name = document.createElement('div');
+    name.className = 'agent-err-label';
+    name.textContent = label;
+    const pre = document.createElement('pre');
+    pre.className = 'agent-err-out';
+    pre.textContent = text;
+    errEl.append(name, pre);
+  }
+  errEl.hidden = false;
+}
+
+function resetHint(session) {
+  if (!session.hintEl) return;
+  session.hintEl.textContent = 'Enter to send, Esc to cancel';
+}
+
+function setBusy(session, busy, msg) {
+  session.el.classList.toggle('busy', busy);
+  session.input.disabled = busy;
+  if (session.sendBtn) session.sendBtn.hidden = busy;
+  if (session.cancelBtn) session.cancelBtn.hidden = !busy;
+  session.closeBtn.disabled = false;
+  if (session.harnessSelect) session.harnessSelect.disabled = busy || !!(S.meta && S.meta.agentPinned);
+  if (session.modelSelect) session.modelSelect.disabled = busy;
+  if (session.hintEl && msg) session.hintEl.textContent = msg;
+}
+
+function showCompose(session) {
+  session.pickEl.hidden = true;
+  if (session.metaEl) session.metaEl.hidden = false;
+  session.composeEl.hidden = false;
+  session.input.focus();
+}
+
+async function showPicker(session) {
+  session.composeEl.hidden = true;
+  if (session.metaEl) session.metaEl.hidden = true;
+  session.pickEl.hidden = false;
+  session.pickEl.innerHTML = '<div class="hint">Looking for coding harnesses…</div>';
+
+  let list = S.meta?.agents || [];
+  let settingsPath = '';
+  // Re-scan, so a harness installed since startup shows up without a restart.
+  try {
+    const j = await api('/api/agent/harnesses');
+    list = j.harnesses || [];
+    settingsPath = j.settings || '';
+    S.meta.agents = list;
+    S.meta.agent = j.selected || '';
+    S.meta.agentModel = j.model || '';
+    S.meta.agentPinned = !!j.pinned;
+  } catch (e) {
+    session.pickEl.innerHTML = '<div class="hint">Could not look for harnesses: ' + esc(e.message) + '</div>';
+    return;
+  }
+
+  const ready = list.filter(h => h.installed);
+  if (!ready.length) {
+    showToast('!', 'Could not find any coding harness like Claude Code, OpenCode, Codex, Antigravity, Aider, etc. Install one and restart px0.', 6000);
+    session.pickEl.innerHTML = '<div class="hint" style="line-height: 1.5; padding: 4px 2px;">' +
+      'Could not find any coding harness like <b>Claude Code</b>, <b>OpenCode</b>, <b>Codex</b>, <b>Antigravity</b> (<code>agy</code>), <b>Aider</b>, <b>Goose</b>, <b>Gemini CLI</b>, or <b>Cursor Agent</b>.<br><br>' +
+      'Please install a coding harness, make sure it is on your <code>PATH</code>, and restart px0 after that.</div>';
+    return;
+  }
+
+  session.pickEl.innerHTML = '<div class="hint">This harness will edit files in this workspace.</div>' +
+    optionsHtml(ready, settingsPath);
+
+  session.pickEl.querySelectorAll('[data-pick]').forEach(b => {
+    b.addEventListener('click', () => pick(session, b.dataset.pick));
+  });
+  session.pickEl.querySelectorAll('.agent-model-select').forEach(sel => {
+    sel.addEventListener('change', async (e) => {
+      e.stopPropagation();
+      await select(sel.dataset.harness, sel.value, msg => showErr(session, msg));
+      showPicker(session);
+    });
+  });
+}
+
+function optionsHtml(ready, settingsPath) {
+  let html = '';
+  for (const h of ready) {
+    const isSelected = h.name === chosen();
+    html += '<div class="agent-opt-wrap">' +
+      '<button class="agent-opt' + (isSelected ? ' on' : '') + '" data-pick="' + esc(h.name) + '">' +
+      '<span class="agent-opt-name">' + esc(h.name) + '</span>' +
+      '<code class="agent-opt-cmd">' + esc(h.cmd) + '</code></button>';
+    if (isSelected && h.models && h.models.length > 0) {
+      html += '<div class="agent-model-row">' +
+        '<span class="agent-model-label">Model:</span>' +
+        '<select class="agent-model-select" data-harness="' + esc(h.name) + '">';
+      for (const m of h.models) {
+        const sel = m === (h.model || chosenModel()) ? ' selected' : '';
+        html += '<option value="' + esc(m) + '"' + sel + '>' + esc(m) + '</option>';
+      }
+      html += '</select></div>';
+    }
+    html += '</div>';
+  }
+  if (settingsPath) html += '<div class="agent-note">Remembered in ' + esc(settingsPath) + '</div>';
+  return html;
+}
+
+async function pick(session, name) {
+  if (await select(name, msg => showErr(session, msg))) showCompose(session);
+}
+
+// Makes name the harness for every later edit. Returns whether it took.
+async function select(name, model, onError) {
+  if (typeof model === 'function') {
+    onError = model;
+    model = '';
+  }
+  try {
+    const params = { name };
+    if (model) params.model = model;
+    const j = await apiPost('/api/agent/select', params);
+    S.meta.agent = j.selected || '';
+    S.meta.agentModel = j.model || '';
+    S.meta.agents = j.harnesses || S.meta.agents;
+    S.meta.agentPinned = !!j.pinned;
+  } catch (e) {
+    if (onError) onError(e.message);
+    return false;
+  }
+  applyAgentMeta();
+  return true;
+}
+
+async function submit(session) {
+  if (session.timer) return;
+  clearErr(session);
+  const instruction = session.input.value.trim();
+  if (!instruction || !session.target) return;
+  const params = { path: session.target.path, l1: session.target.l1, l2: session.target.l2, instruction };
+
+  let job;
+  try {
+    job = await apiPost('/api/agent/edit', params);
+  } catch (e) {
+    showErr(session, e.message);
+    return;
+  }
+
+  session.jobId = job.id;
+  session.harness = job.harness;
+  hideSelectionBar();
+  const initialNote = 'Editing with ' + (chosenModel() ? chosen() + ' (' + chosenModel() + ')' : chosen()) + '...';
+  setBusy(session, true, initialNote);
+  refreshStatusNote();
+  session.timer = setTimeout(() => tick(session), 400);
+}
+
+async function tick(session) {
+  if (!session.jobId) return;
+  let j;
+  try {
+    j = await api('/api/agent/job?id=' + session.jobId);
+  } catch (e) {
+    if (!session.jobId) return;
+    session.timer = null;
+    /* A finished job that failed comes back with an error field, which the
+       request helper turns into a throw. It still holds the harness output. */
+    if (e.body && 'running' in e.body) {
+      await finish(session, e.body);
+      refreshStatusNote();
+      return;
+    }
+    setBusy(session, false);
+    resetHint(session);
+    refreshStatusNote();
+    showErr(session, e.message);
+    return;
+  }
+
+  if (!session.jobId) return;
+  if (j.running) {
+    session.harness = j.harness;
+    session.elapsed = Math.round((j.ms || 0) / 1000) + 's';
+    setBusy(session, true, 'Editing with ' + j.harness + '... ' + session.elapsed);
+    refreshStatusNote();
+    session.timer = setTimeout(() => tick(session), 600);
+    return;
+  }
+
+  session.timer = null;
+  await finish(session, j);
+  refreshStatusNote();
+}
+
+/* The status bar has one shared note. With one edit running it names the
+   harness and how long it has been going; with several, a count is all that
+   fits without the bar fighting itself over whose turn it is to speak. */
+function refreshStatusNote() {
+  const busy = [...sessions.values()].filter(s => s.timer);
+  if (!busy.length) {
+    setStatusNote('');
+  } else if (busy.length === 1) {
+    const s = busy[0];
+    setStatusNote('Editing with ' + (s.harness || chosen()) + '... ' + (s.elapsed || ''));
+  } else {
+    setStatusNote(busy.length + ' edits running...');
+  }
+}
+
+async function finish(session, j) {
+  const editTarget = session.target;
+  if (j.error) {
+    setBusy(session, false);
+    resetHint(session);
+    showErr(session, (j.harness || 'agent') + ': ' + j.error, [
+      ['stderr', (j.stderr || '').trim()],
+      ['stdout', (j.stdout || j.log || '').trim()],
+    ]);
+    if (j.changed?.length) reloadWorkspace(null);
+    return; // leave the box open so the error stays visible
+  }
+
+  sessions.delete(session.id);
+  session.el.remove();
+  syncBoxVisibility();
+  syncAgentTargets();
+
+  /* Without git px0 cannot tell what the harness touched, so an empty list
+     means "unknown" rather than "nothing" and everything is reloaded. */
+  const changed = j.changed || [];
+  if (!changed.length && j.tracked !== false) {
+    showToast('✓', 'Finished with no file changes');
+    return;
+  }
+
+  if (!await reloadWorkspace(editTarget, 'Edited')) return;
+  showToast('✓', !changed.length ? 'Reloaded the workspace'
+    : changed.length === 1 ? 'Updated ' + changed[0]
+      : 'Updated ' + changed.length + ' files');
+}
+
+/* Reload in the order the data depends on: the index first, so the tree and
+   git badges agree with disk, then the open tabs, which keep their scroll,
+   cursor and view across the swap. Two edits can finish close together, so
+   reloads are queued rather than left to interleave. Returns whether it worked. */
+let reloadChain = Promise.resolve();
+function reloadWorkspace(focus, what = 'Changed') {
+  const run = async () => {
+    try {
+      await api('/api/reindex');
+      await reloadOpenTabs();
+      if (focus?.path) {
+        await openFile(focus.path, { line: focus.l1, push: false });
+      }
+      await drawTree('', treeEl, 0);
+    } catch (e) {
+      showToast('!', what + ', but the reload failed: ' + e.message);
+      return false;
+    }
+    return true;
+  };
+  const result = reloadChain.then(run, run);
+  reloadChain = result.then(() => {}, () => {});
+  return result;
+}
+
+function initAgent() {
+  if (!box || !tpl) return;
+  setAgentHandler(openAgentEdit);
+
+  /* At least one harness is still writing to disk: leaving would abandon it
+     with no way back to see how it went, so the tab asks first. */
+  addEventListener('beforeunload', e => {
+    if (!anyInFlight()) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+}
+
 // --- File: web/src/main.js ---
 // web/src/main.js
+
+
 
 
 
@@ -3846,9 +5641,11 @@ initPalette();
 initShortcuts();
 initMarkdown();
 initDiff();
+initAgent();
 initMetrics();
 initStatus();
 initStatusFit();
+initSettings();
 
 // Bootstrap application lifecycle
 (async function boot() {
@@ -3860,10 +5657,9 @@ initStatusFit();
     S.wrap = wrapPref !== null ? wrapPref === 'true' : true;
     document.body.classList.toggle('word-wrap', S.wrap);
 
-    // Restore line numbers (default ON)
-    const linesPref = localStorage.getItem('px0.lineNumbers');
-    S.lineNumbers = linesPref !== null ? linesPref === 'true' : true;
-    document.body.classList.toggle('hide-lines', !S.lineNumbers);
+    // Line numbers are always ON
+    S.lineNumbers = true;
+    document.body.classList.remove('hide-lines');
 
     // Restore Markdown preview (default ON)
     const mdPref = localStorage.getItem('px0.mdPreview');
@@ -3882,6 +5678,7 @@ initStatusFit();
   S.meta = await api('/api/meta');
   if (S.meta.metrics) updateMetricsDisplay(S.meta.metrics);
   if (S.meta.git) { const b = $('#btn-changed'); if (b) b.hidden = false; }
+  applyAgentMeta();
   document.title = S.meta.name + ' - px0';
   $('#root-name').textContent = S.meta.name;
   $('#root-name').title = S.meta.root;
@@ -3928,6 +5725,9 @@ initStatusFit();
       }
     }, 150);
   }
+
+  // Load harnesses and models asynchronously after the browser is loaded.
+  loadAgentAsync();
 })();
 
 })();

@@ -6,14 +6,29 @@ import { flashFind } from './lsp.js';
 export const resultsEl = $('#results');
 export let lastResults = null;
 
+let searchAbort = null;
+
+export function cancelSearch() {
+  if (searchAbort) {
+    searchAbort.abort();
+    searchAbort = null;
+  }
+}
+
 // The search panel is optional markup; without it every entry point is a no-op.
 export const runSearch = debounce(async () => {
   const qEl = $('#q');
-  const resEl = $('#results');
-  if (!qEl || !resEl) return;
+  if (!qEl || !resultsEl) return;
   const q = qEl.value;
-  if (!q.trim()) { resEl.innerHTML = ''; return; }
-  resEl.innerHTML = '<div class="hint">searching…</div>';
+  if (!q.trim()) {
+    cancelSearch();
+    resultsEl.innerHTML = '';
+    return;
+  }
+  cancelSearch();
+  const controller = new AbortController();
+  searchAbort = controller;
+  resultsEl.innerHTML = '<div class="hint">searching…</div>';
   const params = {
     q, glob: $('#glob')?.value || '',
     case: $('#o-case')?.classList.contains('on') ? 1 : '',
@@ -21,19 +36,25 @@ export const runSearch = debounce(async () => {
     re: $('#o-re')?.classList.contains('on') ? 1 : '',
   };
   try {
-    const j = await api('/api/search', params);
-    renderResults(j);
+    const j = await api('/api/search', params, { signal: controller.signal });
+    if (searchAbort === controller) {
+      searchAbort = null;
+      renderResults(j);
+    }
   } catch (e) {
-    resEl.innerHTML = '<div class="hint">' + esc(e.message) + '</div>';
+    if (e.name === 'AbortError') return;
+    if (searchAbort === controller) {
+      searchAbort = null;
+      resultsEl.innerHTML = '<div class="hint">' + esc(e.message) + '</div>';
+    }
   }
 }, 160);
 
 export function renderResults(j) {
   lastResults = j;
-  const resEl = $('#results');
-  if (!resEl) return;
+  if (!resultsEl) return;
   if (!j.results || !j.results.length) {
-    resEl.innerHTML = '<div class="hint">No results.</div>';
+    resultsEl.innerHTML = '<div class="hint">No results.</div>';
     return;
   }
   const head = j.header || (j.total.toLocaleString() + ' result' + (j.total === 1 ? '' : 's') +
@@ -53,7 +74,7 @@ export function renderResults(j) {
     }
     html += '</div>';
   }
-  resEl.innerHTML = html;
+  resultsEl.innerHTML = html;
 }
 
 /* External results carry an absolute path, which is far too long for the
@@ -65,34 +86,30 @@ export function displayPath(p) {
 }
 
 export function initSearch() {
-  const resEl = $('#results');
-  const qEl = $('#q');
-  if (!resEl || !qEl) return;
-  resEl.addEventListener('click', e => {
+  if (!resultsEl) return;
+  resultsEl.addEventListener('click', e => {
     const t = e.target.closest('[data-toggle]');
     if (t) {
-      const g = resEl.querySelector('[data-group="' + CSS.escape(t.dataset.toggle) + '"]');
-      if (g) {
-        const hidden = g.style.display === 'none';
-        g.style.display = hidden ? '' : 'none';
-        $('.ar', t).innerHTML = hidden ? '&#9660;' : '&#9654;';
-      }
+      const g = resultsEl.querySelector('[data-group="' + CSS.escape(t.dataset.toggle) + '"]');
+      const hidden = g.style.display === 'none';
+      g.style.display = hidden ? '' : 'none';
+      $('.ar', t).innerHTML = hidden ? '&#9660;' : '&#9654;';
       return;
     }
     const r = e.target.closest('.rline');
     if (r) {
-      $$('.rline.sel', resEl).forEach(x => x.classList.remove('sel'));
+      $$('.rline.sel', resultsEl).forEach(x => x.classList.remove('sel'));
       r.classList.add('sel');
       openFile(r.dataset.p, { line: +r.dataset.n });
-      const q = qEl.value;
+      const q = $('#q').value;
       if (q) flashFind(q);
     }
   });
 
-  qEl.addEventListener('input', runSearch);
-  $('#glob')?.addEventListener('input', runSearch);
-  $$('.opt', $('#panel-search')).forEach(b => b.addEventListener('click', () => { b.classList.toggle('on'); runSearch(); }));
-  qEl.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); const f = $('.rline', resEl); if (f) f.click(); }
+  $('#q').addEventListener('input', runSearch);
+  $('#glob').addEventListener('input', runSearch);
+  $$('.opt').forEach(b => b.addEventListener('click', () => { b.classList.toggle('on'); runSearch(); }));
+  $('#q').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); const f = $('.rline', resultsEl); if (f) f.click(); }
   });
 }

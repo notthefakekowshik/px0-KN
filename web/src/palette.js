@@ -1,6 +1,6 @@
 // web/src/palette.js
 import { $, esc, S, doc_, api, debounce, withKeys } from './state.js';
-import { render, toggleWordWrap, toggleLineNumbers } from './renderer.js';
+import { render, toggleWordWrap } from './renderer.js';
 import { openFile, centerLine, closeTab, reopenClosedTab } from './tabs.js';
 import { updateStatus } from './status.js';
 import { pushHistory } from './history.js';
@@ -13,6 +13,7 @@ import { showCalls, openLspSetup } from './calls.js';
 import { showHelp } from './shortcuts.js';
 import { listThemes, currentTheme, setTheme, cycleTheme } from './theme.js';
 import { togglePreview } from './markdown.js';
+import { openSettings } from './settings.js';
 
 export const overlay = $('#overlay');
 export const palInput = $('#pal');
@@ -20,6 +21,8 @@ export const palList = $('#pal-list');
 export let pal = null;
 
 export const COMMANDS = [
+  { name: withKeys('Preferences: Open Settings (UI) ({Mod+,})'), run: () => openSettings('ui') },
+  { name: 'Preferences: Open Settings (JSON)', run: () => openSettings('json') },
   { name: 'Go to File…', run: () => openPalette('file') },
   { name: 'Go to Symbol in File…', run: () => openPalette('symbol') },
   { name: 'Go to Line…', run: () => openPalette('line') },

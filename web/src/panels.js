@@ -5,33 +5,16 @@ import { updateStatus } from './status.js';
 import { loadOutline } from './outline.js';
 import { treeEl, openDirs, drawTree } from './tree.js';
 import { reloadOpenTabs } from './tabs.js';
+import { showToast } from './ui.js';
 
 export function showPanel(name) {
   document.body.classList.remove('side-hidden');
-  const filesPanel = $('#panel-files');
-  const searchPanel = $('#panel-search');
-  if (name === 'search') {
-    filesPanel?.classList.remove('active');
-    searchPanel?.classList.add('active');
-    const q = $('#q');
-    if (q) {
-      q.focus();
-      q.select();
-    }
-  } else {
-    searchPanel?.classList.remove('active');
-    filesPanel?.classList.add('active');
-  }
   layout();
   render();
 }
 
 export function initPanels() {
-  $('#btn-show-search')?.addEventListener('click', () => showPanel('search'));
-  $('#btn-show-files')?.addEventListener('click', () => showPanel('files'));
-
   $('#btn-reindex').addEventListener('click', async () => {
-    $('#st-index').textContent = 'reindexing…';
     const j = await api('/api/reindex');
     S.meta.files = j.files; S.meta.indexMs = j.indexMs;
     treeEl.innerHTML = ''; openDirs.clear();
@@ -39,6 +22,7 @@ export function initPanels() {
     // Reindex is a refresh: re-fetch open tabs quietly in place without tab switching.
     await reloadOpenTabs();
     updateStatus();
+    showToast('✓', 'Workspace reindexed');
   });
 
   /* sidebar resize */

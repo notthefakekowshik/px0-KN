@@ -1,3 +1,5 @@
+// Package main implements px0: a fast, local-first code navigator and review tool
+// that opens any repository or pull request in a responsive browser UI.
 package main
 
 import (
@@ -41,9 +43,12 @@ func main() {
 		noTelemetry  = flag.Bool("no-telemetry", false, "disable anonymous usage telemetry")
 		agentCmd     = flag.String("agent", "", "pin the coding harness used for edits (claude, gemini, cursor-agent, agy, opencode, codex, aider, goose, or a command template containing {prompt}); detected and chosen in the UI when omitted")
 		noAgent      = flag.Bool("no-agent", false, "do not offer editing through a coding harness")
+		_            = flag.Bool("y", false, "answer yes to prompts (deprecated; PRs are always opened without prompt)")
+		_            = flag.Bool("yes", false, "answer yes to prompts (alias for -y)")
+		basePathFlag = flag.String("base-path", "", "base URL path prefix to serve endpoints and assets from (e.g. /rev-123/)")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage: px0 [flags] [file or directory]\n\nflags:\n", version)
+		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage:\n  px0 [flags] [file or directory]\n  px0 [flags] <pr-url>\n\nflags:\n", version)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -80,13 +85,55 @@ func main() {
 		}
 	}
 
+	// A full pull request URL (e.g. https://github.com/owner/repo/pull/123)
+	// checks out the PR's full source tree instead of resolving a local file/directory.
+	// Only full URLs via "px0 <url>" are supported for PR review.
 	target := "."
+	var prProvider GitProvider
+	var prTarget PRTarget
+	isPR := false
 	if flag.NArg() > 0 {
-		target = flag.Arg(0)
+		arg0 := flag.Arg(0)
+		if arg0 == "pr" {
+			fatal(fmt.Errorf("'px0 pr' is no longer supported; open pull requests directly with: px0 <url>"))
+		}
+		if provider, pt, ok := DetectPRURL(arg0); ok {
+			prProvider, prTarget, isPR = provider, pt, true
+		} else {
+			target = arg0
+		}
 	}
-	root, initialFile, initialLine, err := resolveTarget(target)
-	if err != nil {
-		fatal(err)
+	if isPR && gitDisabled {
+		fatal(fmt.Errorf("px0: git is required for PR review; remove -no-git"))
+	}
+
+	var pr *prSession
+	var root, initialFile string
+	var initialLine int
+	if isPR {
+		sp := newSpinner(fmt.Sprintf("Preparing PR #%d (%s/%s)...", prTarget.Number, prTarget.Owner, prTarget.Repo), os.Stdout)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		p, err := checkoutPR(ctx, prProvider, prTarget, ".", func(msg string) {
+			sp.Update(msg)
+		})
+		cancel()
+		if err != nil {
+			sp.Fail(fmt.Sprintf("Failed to prepare PR #%d: %v", prTarget.Number, err))
+			fatal(fmt.Errorf("px0: %w", err))
+		}
+		if p.meta.Merged {
+			sp.Success(fmt.Sprintf("PR #%d checked out [merged] (%s)", prTarget.Number, p.meta.Title))
+		} else {
+			sp.Success(fmt.Sprintf("PR #%d checked out (%s)", prTarget.Number, p.meta.Title))
+		}
+		pr = p
+		root = p.Root()
+	} else {
+		r, f, l, err := resolveTarget(target)
+		if err != nil {
+			fatal(err)
+		}
+		root, initialFile, initialLine = r, f, l
 	}
 
 	ln, addr, err := listen(*host, *port)
@@ -99,7 +146,17 @@ func main() {
 	tel := NewTelemetryService(*noTelemetry)
 	defer tel.Close("normal")
 
-	pxSrv := NewServer(ix, lsp)
+	configuredBasePath := "/"
+	if *basePathFlag != "" {
+		configuredBasePath = cleanBasePath(*basePathFlag)
+	} else if cfg := readSettings(); cfg.ServerBasePath != nil && *cfg.ServerBasePath != "" {
+		configuredBasePath = cleanBasePath(*cfg.ServerBasePath)
+	}
+
+	pxSrv := NewServer(ix, lsp, configuredBasePath)
+	if pr != nil {
+		pxSrv.SetPR(pr)
+	}
 	var agent *agentManager
 	if !*noAgent {
 		agent, err = newAgentManager(root, *agentCmd, lsp)
@@ -111,8 +168,18 @@ func main() {
 
 	srv := &http.Server{Handler: pxSrv}
 
-	url := viewerURL(addr, initialFile, initialLine)
+	url := viewerURL(addr, initialFile, initialLine, configuredBasePath)
 	uiHeading("px0 "+version, nil, os.Stdout)
+	if pr != nil {
+		prTitle := fmt.Sprintf("#%d %s", pr.meta.Number, pr.meta.Title)
+		if pr.meta.Merged {
+			prTitle += " " + paint("[MERGED]", colorWarn, true, os.Stdout)
+		}
+		uiKV("PR", prTitle, 11, os.Stdout)
+		if pr.token == "" {
+			uiKV("access", uiDim(fmt.Sprintf("read-only (no %s token: set GITHUB_TOKEN or gh auth login to submit reviews)", pr.provider.Name()), os.Stdout), 11, os.Stdout)
+		}
+	}
 	uiKV("workspace", root, 11, os.Stdout)
 	uiKV("url", uiAccent(url, os.Stdout), 11, os.Stdout)
 	uiHint("ctrl-c to stop", os.Stdout)
@@ -179,6 +246,8 @@ func main() {
 	err = srv.Serve(ln)
 	lsp.Close()
 	agent.Close()
+	pxSrv.CloseThreads()
+	pr.Close()
 
 	if interrupted {
 		tel.Close("interrupted")
@@ -276,8 +345,15 @@ func splitTargetLine(target string) (path string, line int) {
 	return target, 0
 }
 
-func viewerURL(addr, initialFile string, initialLine int) string {
+func viewerURL(addr, initialFile string, initialLine int, basePath ...string) string {
 	u := url.URL{Scheme: "http", Host: addr}
+	bp := "/"
+	if len(basePath) > 0 && basePath[0] != "" {
+		bp = cleanBasePath(basePath[0])
+	}
+	if bp != "/" {
+		u.Path = bp
+	}
 	q := u.Query()
 	if initialFile != "" {
 		q.Set("path", filepath.ToSlash(initialFile))

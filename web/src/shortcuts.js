@@ -6,7 +6,7 @@ import { updateStatus } from './status.js';
 import { closeTab, switchTab, reopenClosedTab } from './tabs.js';
 import { go } from './history.js';
 import { clearLink, hovercard } from './hover.js';
-import { openFind, clearFind, findbar } from './find.js';
+import { openFind, clearFind, findbar, findNextMatch } from './find.js';
 import { gotoDefinition, findReferences } from './lsp.js';
 import { showRightInspector, hideRightInspector } from './inspector.js';
 import { overlay, openPalette, closePalette } from './palette.js';
@@ -18,6 +18,10 @@ import { cycleTheme } from './theme.js';
 import { previewing, togglePreview, previewKey, selectPreview } from './markdown.js';
 import { toggleDiff } from './diff.js';
 import { openSettings, closeSettings, isSettingsOpen } from './settings.js';
+import { handleVimKeyDown, isVimEnabled, getVimMode, showVimHelp, closeVimHelp } from './vim.js';
+import { handleImageKey } from './imageview.js';
+import { submitBatch } from './agent.js';
+import { reindexWorkspace } from './panels.js';
 
 /* Each entry lists alternative combos, written as for keyLabel in state.js so
    they show as ⌘/⌥/⇧ on a Mac and Ctrl/Alt/Shift elsewhere. Browsers keep
@@ -26,7 +30,7 @@ export const SHORTCUTS = [
   [['Mod+,'], 'Open settings'],
   [['Mod+K'], 'Quick search / palette'], [['Mod+P'], 'Go to file'],
   [['Mod+Shift+P'], 'Command palette'], [['Mod+Shift+O'], 'Go to symbol'],
-  [['Mod+Shift+F'], 'Search in files'], [['Mod+F'], 'Find in file'],
+  [['Mod+Shift+F'], 'Search in files'], [['Mod+Shift+R'], 'Refresh workspace'], [['Mod+F'], 'Find in file'],
   [['Mod+G'], 'Go to line'], [['Mod+D'], 'Toggle diff view (git)'], [['Alt+Z'], 'Toggle word wrap'],
   [['Alt+L'], 'Toggle line numbers'], [['Alt+M'], 'Toggle Preview (Markdown/HTML)'],
   [['Enter', 'Shift+Enter'], 'Next / previous match'],
@@ -39,6 +43,7 @@ export const SHORTCUTS = [
   [['Mod+A'], 'Select whole file'],
   [['Alt+C', 'Alt+A'], 'Copy selection ref / with context'], [['Alt+U'], 'Find usages of selection'],
   [['Alt+E'], 'Edit selection inline'],
+  [['Alt+T'], 'Start a thread on the selection'],
   [['Right click'], 'Selection actions at the pointer'],
   [['Mod+Home|Mod+Up', 'Mod+End|Mod+Down'], 'Top / bottom of file'],
   [['Home|Mod+Left', 'End|Mod+Right'], 'Start / end of line'],
@@ -49,11 +54,19 @@ export const SHORTCUTS = [
 export function showHelp() {
   const h = $('#helpsheet');
   const ver = S.meta?.version ? ` <span class="help-version">v${esc(S.meta.version)}</span>` : '';
-  h.innerHTML = '<div class="help-card"><div class="help-header"><h2>Keyboard Shortcuts</h2>' + ver + '</div><dl class="help-grid">' +
-    SHORTCUTS.map(([combos, v]) =>
-      '<dt>' + combos.map(keyCaps).filter(Boolean).join('<span class="key-or">/</span>') + '</dt>' +
-      '<dd>' + esc(v) + '</dd>').join('') + '</dl></div>';
+  h.innerHTML = '<div class="help-card"><div class="help-header"><h2>Keyboard Shortcuts</h2>' + ver +
+    '<button id="btn-switch-to-vim-help" class="settings-btn-link" style="margin-left:auto;font-size:12px;cursor:pointer;" title="View Vim Keybindings">View Vim Keybindings</button></div><dl class="help-grid">' +
+    SHORTCUTS.map(([combos, v]) => {
+      const comboList = Array.isArray(combos) ? combos : [combos];
+      return '<dt>' + comboList.map(keyCaps).filter(Boolean).join('<span class="key-or">/</span>') + '</dt>' +
+        '<dd>' + esc(v) + '</dd>';
+    }).join('') + '</dl></div>';
   h.hidden = false;
+  h.querySelector('#btn-switch-to-vim-help')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    h.hidden = true;
+    showVimHelp();
+  });
 }
 
 export const inField = el => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
@@ -79,6 +92,7 @@ export function initShortcuts() {
     else if (act === 'md-preview') togglePreview();
     else if (act === 'palette') openPalette('command');
     else if (act === 'settings') openSettings('ui');
+    else if (act === 'vim-help') showVimHelp();
     else if (act === 'help') showHelp();
   });
 
@@ -86,6 +100,10 @@ export function initShortcuts() {
     const mod = e[MOD];
 
     if (e.key === 'Escape') {
+      const lb = $('#img-lightbox');
+      if (lb && !lb.hidden) { lb.hidden = true; return; }
+      if (!$('#vim-helpsheet')?.hidden) { closeVimHelp(); return; }
+      if (isVimEnabled() && handleVimKeyDown(e)) return;
       if (isSettingsOpen()) { closeSettings(); return; }
       if (!overlay.hidden) { closePalette(); return; }
       if (!$('#helpsheet').hidden) { $('#helpsheet').hidden = true; return; }
@@ -94,7 +112,7 @@ export function initShortcuts() {
       if (S.selAll) { clearSelectAll(); return; }
       if (!document.body.classList.contains('right-hidden')) { hideRightInspector(); return; }
       if (S.occ) { S.occ = null; paint(); return; }
-      if (inField(document.activeElement)) document.activeElement.blur();
+      if (inField(document.activeElement)) /** @type {HTMLElement} */ (document.activeElement).blur();
       return;
     }
 
@@ -121,6 +139,7 @@ export function initShortcuts() {
     if (mod && e.shiftKey && (e.key === 'P' || e.key === 'p')) { e.preventDefault(); openPalette('command'); return; }
     if (mod && e.shiftKey && (e.key === 'O' || e.key === 'o')) { e.preventDefault(); showRightInspector('symbols'); return; }
     if (mod && e.shiftKey && (e.key === 'F' || e.key === 'f')) { e.preventDefault(); showRightInspector('search'); $('#q')?.select(); return; }
+    if (mod && e.shiftKey && (e.key === 'R' || e.key === 'r')) { e.preventDefault(); reindexWorkspace(); return; }
     if (mod && !e.shiftKey && (e.key === 'p' || e.key === 'P')) { e.preventDefault(); openPalette('file'); return; }
     if (mod && (e.key === 'g' || e.key === 'G')) { e.preventDefault(); openPalette('line'); return; }
     if (mod && (e.key === 'f' || e.key === 'F')) { e.preventDefault(); openFind(S.lastWord); return; }
@@ -174,6 +193,21 @@ export function initShortcuts() {
       return;
     }
 
+    if (mod && e.shiftKey && !e.altKey && e.key === 'Enter') {
+      const b = $('#agentbox');
+      if (b && !b.hidden) {
+        e.preventDefault();
+        submitBatch();
+        return;
+      }
+    }
+
+    if (!mod && e.key === 'Enter' && !findbar.hidden) {
+      e.preventDefault();
+      findNextMatch(e.shiftKey ? -1 : 1);
+      return;
+    }
+
     if (inField(document.activeElement)) return;
 
     // Select all takes the open file only, never the sidebar or status bar around it.
@@ -181,9 +215,12 @@ export function initShortcuts() {
     if (plainMod && (e.key === 'a' || e.key === 'A')) { e.preventDefault(); if (previewing()) selectPreview(); else selectAll(); return; }
     if (plainMod && (e.key === 'c' || e.key === 'C') && copySelectAll()) { e.preventDefault(); return; }
 
+    if (handleVimKeyDown(e)) return;
+
     if (e.key === '?') { e.preventDefault(); showHelp(); return; }
     const d = doc_();
     if (!d) return;
+    if (d.isImage) { if (handleImageKey(e)) e.preventDefault(); return; }
     if (previewing(d)) { if (previewKey(e)) e.preventDefault(); return; }
     const toTop = () => { vp.scrollTop = 0; d.cur = 1; render(); updateStatus(); };
     const toBottom = () => { vp.scrollTop = sizer.offsetHeight; d.cur = d.total; render(); updateStatus(); };

@@ -1,5 +1,6 @@
 // web/src/markdown.js
-import { $, $$, S, doc_, api, isMac, MOD, LH } from './state.js';
+import { $, $$, S, doc_, esc, api, isMac, MOD, LH } from './state.js';
+import { on } from './bus.js';
 import { vp, rowsEl, copyToClipboard, showToast } from './ui.js';
 import { render, paint, rowFor, markNodes } from './renderer.js';
 import { openFile } from './tabs.js';
@@ -57,10 +58,9 @@ export function syncPreview() {
     mdDrawn = null;
     if (htmlview) {
       htmlview.hidden = false;
-      const targetSrc = '/api/raw/' + encodeURI(d.path);
       if (htmlview.dataset.path !== d.path) {
         htmlview.dataset.path = d.path;
-        htmlview.src = targetSrc;
+        htmlview.src = new URL('api/raw/' + encodeURI(d.path), document.baseURI).href;
       }
     }
   }
@@ -185,7 +185,7 @@ function mdSanitize(html, docPath) {
         c === 'md-code' || c.startsWith('footnote') || (tag === 'i' && MD_TOKENS.has(c)));
       if (keep.length) el.className = keep.join(' ');
     }
-    if (tag === 'input') el.disabled = true;
+    if (tag === 'input') /** @type {HTMLInputElement} */ (el).disabled = true;
     if (tag === 'img') mdSetImage(el, mdURL(attrs.src || ''), base);
     if (tag === 'a' && attrs.href) mdSetLink(el, mdURL(attrs.href), base);
   }
@@ -207,14 +207,26 @@ function mdLocal(ref, base) {
 }
 
 function mdSetImage(img, src, base) {
+  img.setAttribute('loading', 'lazy');
+  img.setAttribute('decoding', 'async');
+  img.classList.add('md-zoomable');
   const m = MD_SCHEME.exec(src);
   if (m) {
-    if (/^https?$/i.test(m[1]) || /^data:image\//i.test(src)) img.setAttribute('src', src);
+    if (/^https?$/i.test(m[1]) || /^data:image\//i.test(src)) {
+      img.setAttribute('src', src);
+      img.dataset.origSrc = src;
+    }
   } else if (src.startsWith('//')) {
     img.setAttribute('src', src);
+    img.dataset.origSrc = src;
   } else if (src) {
     const t = mdLocal(src, base);
-    if (t) img.setAttribute('src', '/api/raw?path=' + encodeURIComponent(t.path));
+    if (t) {
+      const rawUrl = new URL('api/raw?path=' + encodeURIComponent(t.path), document.baseURI || location.href).href;
+      img.setAttribute('src', rawUrl);
+      img.dataset.rawPath = t.path;
+      img.dataset.origSrc = src;
+    }
   }
 }
 
@@ -236,7 +248,8 @@ function mdSetLink(a, href, base) {
   }
   const t = mdLocal(href, base);
   if (!t) return;
-  a.setAttribute('href', '/api/raw?path=' + encodeURIComponent(t.path));
+  const rawUrl = new URL('api/raw?path=' + encodeURIComponent(t.path), document.baseURI || location.href).href;
+  a.setAttribute('href', rawUrl);
   a.dataset.path = t.path;
   if (t.hash) a.dataset.anchor = t.hash;
 }
@@ -372,8 +385,8 @@ function mdJump(anchor) {
   if (!d || !el) return;
   pushHistory(d.path, previewTopLine());
   mdScrollTo(el);
-  const block = el.closest('[data-line]');
-  if (block) pushHistory(d.path, +block.dataset.line);
+  const block = /** @type {HTMLElement|null} */ (el.closest('[data-line]'));
+  if (block && block.dataset.line) pushHistory(d.path, +block.dataset.line);
 }
 
 /* ---------- keys, select all, find ---------- */
@@ -450,13 +463,58 @@ export function initMarkdown() {
 
   mdArticle.addEventListener('click', e => {
     const copy = e.target.closest('.md-copy');
-    if (copy) { copyToClipboard($('pre', copy.parentElement).textContent, 'Copied code block'); return; }
+    if (copy) {
+      const pre = $('pre', copy.parentElement);
+      if (pre) {
+        copyToClipboard(pre.textContent || '', 'Copied code block');
+        copy.classList.add('copied');
+        copy.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5 8.5 6.5 11.5 12.5 5.5"/></svg>';
+        setTimeout(() => {
+          copy.classList.remove('copied');
+          copy.innerHTML = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5V3a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg>';
+        }, 1400);
+      }
+      return;
+    }
+
+    // Standalone image click opens interactive lightbox
+    const img = e.target.closest('img.md-zoomable');
     const a = e.target.closest('a');
+    if (img && !a && e.button === 0 && !e[MOD] && !e.shiftKey) {
+      e.preventDefault();
+      openLightbox(img);
+      return;
+    }
+
     // Modified clicks keep the browser's behaviour: the href opens the raw file.
     if (!a || e.button !== 0 || e[MOD] || e.shiftKey) return;
     if ('path' in a.dataset) { e.preventDefault(); mdFollow(a.dataset.path, a.dataset.anchor || ''); }
     else if ('anchor' in a.dataset) { e.preventDefault(); mdJump(a.dataset.anchor); }
   });
+
+  // Gracefully handle broken / 404 images in markdown
+  mdArticle.addEventListener('error', e => {
+    if (e.target && e.target.localName === 'img') {
+      const img = e.target;
+      const path = img.dataset.rawPath || img.dataset.origSrc || img.getAttribute('src') || 'image';
+      const fallback = document.createElement('div');
+      fallback.className = 'md-img-broken';
+      fallback.innerHTML = '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="2"/><path d="M2 14l5-5 3 3 4-4"/><circle cx="5.5" cy="5.5" r="1.5"/><line x1="2" y1="2" x2="14" y2="14"/></svg><span>Image not found: ' + esc(path) + '</span>';
+      img.replaceWith(fallback);
+    }
+  }, true);
+
+  // Lightbox backdrop & close button
+  const lb = $('#img-lightbox');
+  if (lb) {
+    lb.addEventListener('click', e => {
+      if (e.target.closest('.lightbox-close') || e.target.classList.contains('lightbox-backdrop')) {
+        lb.hidden = true;
+      }
+    });
+  }
+  on('tab:activated', () => syncPreview());
+  on('tabs:cleared', () => syncPreview());
 
   htmlview?.addEventListener('load', () => {
     try {
@@ -468,4 +526,52 @@ export function initMarkdown() {
       });
     } catch {}
   });
+}
+
+export function openLightbox(img) {
+  const lb = $('#img-lightbox');
+  if (!lb) return;
+
+  const lbImg = $('#lb-img');
+  const lbTitle = $('#lb-title');
+  const lbMeta = $('#lb-meta');
+  const lbOpenTab = $('#lb-open-tab');
+  const lbCopyPath = $('#lb-copy-path');
+
+  const src = img.getAttribute('src');
+  const rawPath = img.dataset.rawPath || '';
+  const alt = img.getAttribute('alt') || '';
+  const displayTitle = rawPath || alt || src.split('/').pop() || 'Image Preview';
+
+  lbImg.src = src;
+  lbTitle.textContent = displayTitle;
+  lbTitle.title = displayTitle;
+
+  const updateMeta = () => {
+    if (lbImg.naturalWidth) {
+      lbMeta.textContent = `${lbImg.naturalWidth} × ${lbImg.naturalHeight} px`;
+    } else {
+      lbMeta.textContent = '';
+    }
+  };
+  if (lbImg.complete && lbImg.naturalWidth) updateMeta(); else lbImg.onload = updateMeta;
+
+  if (rawPath) {
+    lbOpenTab.hidden = false;
+    lbOpenTab.onclick = () => {
+      lb.hidden = true;
+      openFile(rawPath);
+    };
+    lbCopyPath.hidden = false;
+    lbCopyPath.onclick = () => {
+      copyToClipboard(rawPath, 'Copied image path', lbCopyPath);
+    };
+  } else {
+    lbOpenTab.hidden = true;
+    lbCopyPath.onclick = () => {
+      copyToClipboard(src, 'Copied image URL', lbCopyPath);
+    };
+  }
+
+  lb.hidden = false;
 }

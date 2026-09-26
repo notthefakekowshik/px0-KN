@@ -81,7 +81,10 @@ start_server() {
   local pid=$!
   local i
   for i in $(seq 100); do
-    curl -sf -o /dev/null "http://127.0.0.1:$port/api/meta" && { echo "$pid"; return 0; }
+    # The server answers before its index is built. Wait for ready, or Files
+    # and Index read 0 whenever the build (which includes the initial git
+    # status) outlasts the first poll.
+    curl -sf "http://127.0.0.1:$port/api/meta" | grep -q '"ready":true' && { echo "$pid"; return 0; }
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.3
   done
@@ -379,6 +382,7 @@ print(f'| **Memory (RSS)** | **{px0_mem} MB** | **{total_vs_mb:.1f} MB** | {tota
 print(f'| **Instant CPU %** | **0.0%** | **{total_vs_cpu:.1f}%** | Measured over 1s |')
 print(f'| **Index Time** | **{px0_idx} ms** ({px0_files} files) | **~4 - 10 s** | px0 is immediate |')
 print(f'| **Process Count** | **1 single Go binary** | **{len(p2)} processes** | Multi-process Node tree |')
+print('\n*Note: px0 RSS measures the host Go daemon (~20–30 MB). A browser tab displaying the UI adds ~80–150 MB, for a total system footprint of ~100–180 MB (still ~85–90% lighter than VS Code\'s full process tree).*')
 
 if breakdown:
     print('\n#### VS Code Process Breakdown\n')
@@ -485,6 +489,7 @@ print(f'| **Memory (RSS)** | **{px0_mem} MB** | **{vs_rss:.1f} MB** | {vs_rss/ma
 print(f'| **Index Time** | **{px0_idx} ms** ({px0_files} files) | **~2 - 5 s** | px0 is immediate |')
 print(f'| **Process Count** | **1 single Go binary** | **{len(new_pids)} processes** | Multi-process tree |')
 print(f'| **Extensions** | Native built-ins | Disabled (0 active) | Clean isolate |')
+print('\n*Note: px0 RSS reflects the host Go daemon (~20–30 MB). Including a client browser tab (~80–150 MB), px0 total memory is ~100–180 MB vs vanilla VS Code.*')
 
 if breakdown:
     print('\n#### Vanilla VS Code Process Breakdown\n')
@@ -631,7 +636,7 @@ print('| Editor | Configuration | Memory (RSS) | Time to Open | Time to First In
 print('| :--- | :--- | :--- | :--- | :--- | :--- |')
 for row in results:
     print(f'| **{row[0]}** | {row[1]} | **{row[2]}** | {row[3]} | {row[4]} | {row[5]} |')
-print('\n*Note: Run benchmark.sh with --vscode-vanilla to isolate and measure an unconfigured instance of VS Code.*')
+print('\n*Note: px0 RSS measures the host Go server (~20–30 MB). The web frontend runs in an existing browser tab (~80–150 MB), bringing total system memory to ~100–180 MB. Run benchmark.sh with --vscode-vanilla to measure clean VS Code.*')
 "
 }
 

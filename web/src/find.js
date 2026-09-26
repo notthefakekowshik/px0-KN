@@ -1,5 +1,6 @@
 // web/src/find.js
 import { $, S, doc_, api, debounce, LH } from './state.js';
+import { on } from './bus.js';
 import { vp } from './ui.js';
 import { render, paint } from './renderer.js';
 import { centerLine } from './tabs.js';
@@ -74,7 +75,7 @@ export const runFind = debounce(async () => {
 
 export function drawMinimap(hits, total) {
   const mm = $('#minimap-hits');
-  if (!hits.length) { mm.innerHTML = ''; return; }
+  if (!hits.length || !total) { mm.innerHTML = ''; return; }
   const seen = new Set();
   mm.innerHTML = hits.filter(h => !seen.has(h.line) && seen.add(h.line))
     .map(h => '<i style="top:' + ((h.line - 1) / total * 100).toFixed(3) + '%"></i>').join('');
@@ -97,6 +98,14 @@ export function jumpToHit(i) {
   render(); updateStatus();
 }
 
+export function findNextMatch(delta = 1) {
+  if (!S.find || !S.find.hits || !S.find.hits.length) {
+    if (findInput.value) { runFind(); return; }
+    return;
+  }
+  jumpToHit(S.find.active + delta);
+}
+
 export function initFind() {
   findInput.addEventListener('input', runFind);
   findInput.addEventListener('keydown', e => {
@@ -108,9 +117,10 @@ export function initFind() {
   $('#find-close').addEventListener('click', clearFind);
   $('#minimap-hits').addEventListener('click', e => {
     const r = $('#minimap-hits').getBoundingClientRect();
-    const d = doc_(); if (!d) return;
+    const d = doc_(); if (!d || !r.height || !d.total) return;
     if (previewing(d)) { scrollPreviewTo((e.clientY - r.top) / r.height); return; }
     centerLine(Math.round((e.clientY - r.top) / r.height * d.total));
     render();
   });
+  on('tab:activated', clearFind);
 }

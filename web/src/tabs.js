@@ -1,5 +1,6 @@
 // web/src/tabs.js
-import { $, esc, S, doc_, api, LH, CHUNK, withKeys } from './state.js';
+import { $, esc, S, doc_, api, apiPost, apiPostJson, LH, CHUNK, withKeys } from './state.js';
+import { emit } from './bus.js';
 import { vp, sizer, rowsEl, editor } from './ui.js';
 import { render, layout, refineChunk } from './renderer.js';
 import { updateStatus, setStatusNote, refreshMetrics } from './status.js';
@@ -7,16 +8,63 @@ import { pushHistory } from './history.js';
 import { warmLSP } from './lsp.js';
 import { loadOutline } from './outline.js';
 import { showPanel } from './panels.js';
-import { revealDir, revealFile } from './tree.js';
+import { revealDir, revealFile, treeEl } from './tree.js';
 import { clearLink } from './hover.js';
 import { clearFind } from './find.js';
 import { clearSelectAll } from './selbar.js';
 import { syncPreview, previewing, previewLine } from './markdown.js';
-import { syncDiffView, layoutPref, diffScrollTop } from './diff.js';
+import { syncDiffView, layoutPref, diffScrollTop, setDiffMode, setSourceJumpHandler } from './diff.js';
+import { syncImageView } from './imageview.js';
 
 // Recently closed files, newest last, for Alt+Shift+T.
 const closedTabs = [];
 const MAX_CLOSED = 20;
+let tabMenu = null;
+let tabMenuIndex = -1;
+
+function closeTabMenu() {
+  if (tabMenu) tabMenu.hidden = true;
+  tabMenuIndex = -1;
+}
+
+function closeTabsForAction(action, index) {
+  if (!S.tabs[index]) return;
+  if (action === 'others') switchTab(index);
+  const targets = S.tabs.map((_, i) => i).filter(i => {
+    if (action === 'all') return true;
+    if (action === 'close') return i === index;
+    if (action === 'others') return i !== index;
+    if (action === 'right') return i > index;
+    return i < index;
+  });
+  closeTabs(targets);
+}
+
+function openTabMenu(index, x, y) {
+  const actions = [
+    { action: 'close', label: 'Close', disabled: false },
+    { action: 'all', label: 'Close All', disabled: false },
+    { action: 'others', label: 'Close Others', disabled: S.tabs.length < 2 },
+    { action: 'right', label: 'Close to the Right', disabled: index === S.tabs.length - 1 },
+    { action: 'left', label: 'Close to the Left', disabled: index === 0 },
+  ];
+  tabMenu.replaceChildren();
+  for (const { action, label, disabled } of actions) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'sel-menu-item';
+    button.dataset.tabAction = action;
+    button.setAttribute('role', 'menuitem');
+    button.textContent = label;
+    button.disabled = disabled;
+    tabMenu.append(button);
+  }
+  tabMenuIndex = index;
+  tabMenu.hidden = false;
+  const w = tabMenu.offsetWidth, h = tabMenu.offsetHeight;
+  tabMenu.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + 'px';
+  tabMenu.style.top = Math.max(4, Math.min(y, innerHeight - h - 4)) + 'px';
+}
 
 export async function openFile(path, opts = {}) {
   const { line, push = true, col } = opts;
@@ -30,35 +78,44 @@ export async function openFile(path, opts = {}) {
       setStatusNote(path + ': ' + e.message, 4000);
       return;
     }
-    if (j.image) {
-      showImage(path);
-      return;
-    }
-    const hasDiff = !!j.diffAvailable;
+    const isImg = !!j.image;
+    const hasDiff = !isImg && !!j.diffAvailable;
     const d = {
-      path, name: path.split('/').pop(), lang: j.lang, total: j.total, maxCols: j.maxCols,
-      size: j.size, lines: new Array(j.total), chunks: new Set([start / CHUNK]),
+      path, name: path.split('/').pop(), lang: isImg ? 'image' : j.lang,
+      total: isImg ? 0 : j.total, maxCols: isImg ? 0 : j.maxCols,
+      size: j.size, lines: isImg ? [] : new Array(j.total),
+      chunks: new Set(isImg ? [] : [start / CHUNK]),
       pending: new Set(), refining: new Set(), scrollTop: 0, cur: line || 1,
-      outline: null, gen: 0, markdown: !!j.markdown, html: !!j.html || /\.(html|htm)$/i.test(path), gutter: null,
+      outline: null, gen: 0, markdown: !isImg && !!j.markdown, isImage: isImg,
+      html: !isImg && (!!j.html || /\.(html|htm)$/i.test(path)),
+      gutter: null,
       diffMode: hasDiff ? (layoutPref() || 'split') : null,
       diffAvailable: hasDiff,
       diffDismissed: false,
+      openedInDiffView: hasDiff,
     };
-    for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
-    d.lsp = j.lsp || { state: 'off', server: '' };
+    if (!isImg) {
+      for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
+    }
+    d.lsp = (!isImg && j.lsp) || { state: 'off', server: '' };
     S.tabs.push(d);
     idx = S.tabs.length - 1;
-    if (j.refine) refineChunk(d, start / CHUNK);
-    loadGutter(d);
+    if (!isImg && j.refine) refineChunk(d, start / CHUNK);
+    if (!isImg) loadGutter(d);
   }
   const prev = doc_();
   if (prev && prev !== S.tabs[idx]) prev.scrollTop = vp.scrollTop;
   if (prev !== S.tabs[idx]) { clearSelectAll(); clearFind(); }
   S.active = idx;
   const d = S.tabs[idx];
+  if (d && d.diffAvailable && (treeEl?.classList.contains('changed-only') || (!d.diffDismissed && d.diffMode === null))) {
+    d.diffMode = layoutPref() || 'split';
+    d.diffDismissed = false;
+    d.openedInDiffView = true;
+  }
 
   $('#empty').hidden = true;
-  hideImage();
+  syncImageView();
   syncPreview();
   syncDiffView();
   if (!S.at || S.at.path !== d.path) S.at = null;
@@ -73,8 +130,10 @@ export async function openFile(path, opts = {}) {
   render();
   updateStatus();
   if ($('#panel-outline')?.classList.contains('active')) loadOutline();
-  if (push) pushHistory(path, line || d.cur, col);
+  if (push) pushHistory(path, line || d.cur);
   revealFile(d.path);
+  saveWorkspaceState();
+  emit('tab:activated', { doc: d, prevDoc: prev });
 }
 
 // VS Code-style diff gutter for the normal file view. Fetches once per opened
@@ -82,30 +141,41 @@ export async function openFile(path, opts = {}) {
 // Fetches on any open in a git repo rather than threading per-file status
 // through every open path — the backend returns available:false for
 // clean/untracked files, so the extra request is cheap and self-limiting.
-function loadGutter(d) {
+export async function loadGutter(d) {
   if (!S.meta?.git) return;
-  api('/api/gutter', { path: d.path }).then(j => {
+  try {
+    const j = await api('/api/gutter', { path: d.path });
     d.diffAvailable = !!j.available;
     if (j.available && d.diffMode === null && !d.diffDismissed) {
       d.diffMode = layoutPref() || 'split';
+      d.openedInDiffView = true;
       if (doc_() === d) {
         syncDiffView();
         syncPreview();
       }
     }
-    if (doc_() === d) updateStatus();
-    if (!j.available) return;
-    const marks = new Map();
-    for (const n of j.modified) marks.set(n, 'mod');
-    for (const n of j.added) marks.set(n, 'add');
-    d.gutter = { marks, dels: new Set(j.deleted) };
-    if (doc_() === d) render();
-  }).catch(() => {});
+    if (!j.available) {
+      d.gutter = null;
+    } else {
+      const marks = new Map();
+      for (const n of j.modified) marks.set(n, 'mod');
+      for (const n of j.added) marks.set(n, 'add');
+      d.gutter = { marks, dels: new Set(j.deleted) };
+    }
+    if (doc_() === d) {
+      updateStatus();
+      render();
+    }
+    drawTabs();
+  } catch {}
 }
 
 // Quietly re-fetches all open tabs on workspace reindex without tab-switching thrash.
 // Preserves live scroll position, cursor column/line (clamped), diff settings, and markdown scroll.
-export async function reloadOpenTabs() {
+// onlyIfChanged: leave a tab's doc untouched, and skip the repaint when no tab
+// changed, if the file comes back with the same size, line count and diff
+// availability. Keeps a background refresh from flickering an unchanged view.
+export async function reloadOpenTabs({ onlyIfChanged = false } = {}) {
   if (S.tabs.length === 0) return;
 
   const activeDoc = doc_();
@@ -124,6 +194,7 @@ export async function reloadOpenTabs() {
     start: t.cur ? Math.max(0, Math.floor((t.cur - 1) / CHUNK) * CHUNK) : 0,
   }));
 
+  let anyChanged = false;
   const results = await Promise.allSettled(
     targets.map(tgt => api('/api/file', { path: tgt.path, start: tgt.start, count: CHUNK }))
   );
@@ -142,10 +213,16 @@ export async function reloadOpenTabs() {
     }
 
     const j = res.value;
-    if (j.image) continue;
+    if (j.image) {
+      tgt.oldDoc.size = j.size;
+      continue;
+    }
 
     const keep = tgt.oldDoc;
     const hasDiff = !!j.diffAvailable;
+    if (onlyIfChanged && keep.size === j.size && keep.total === j.total &&
+        !!keep.diffAvailable === hasDiff) continue;
+    anyChanged = true;
     const newCur = Math.max(1, Math.min(keep.cur || 1, j.total));
 
     /* A reload keeps each tab in the view it was in. The file changing under
@@ -175,7 +252,10 @@ export async function reloadOpenTabs() {
       diffMode,
       diffAvailable: hasDiff,
       diffDismissed: !!keep.diffDismissed || !keep.diffMode,
+      openedInDiffView: !!keep.openedInDiffView || !!keep.diffMode,
       diffScroll: keep === activeDoc && keep.diffMode ? diffScrollTop() : 0,
+      prCollapsed: keep.prCollapsed,
+      youCollapsed: keep.youCollapsed,
     };
 
     for (let k = 0; k < j.lines.length; k++) {
@@ -185,8 +265,12 @@ export async function reloadOpenTabs() {
 
     S.tabs[idx] = d;
     if (j.refine) refineChunk(d, tgt.start / CHUNK);
-    loadGutter(d);
   }
+
+  if (onlyIfChanged && !anyChanged) return;
+
+  // Load all gutters concurrently before initial paint
+  await Promise.allSettled(S.tabs.filter(t => !t.isImage).map(t => loadGutter(t)));
 
   const d = doc_();
   if (d) {
@@ -194,8 +278,9 @@ export async function reloadOpenTabs() {
     S.lsp.server = (d.lsp && d.lsp.server) || '';
     S.lsp.missing = (d.lsp && d.lsp.missing) || '';
     warmLSP(d);
+    syncImageView();
     syncPreview();
-    syncDiffView();
+    syncDiffView(true);
     layout();
     vp.scrollTop = d.scrollTop;
     render();
@@ -205,6 +290,8 @@ export async function reloadOpenTabs() {
   drawTabs();
   drawCrumbs();
   updateStatus();
+  saveWorkspaceState();
+  if (d) emit('tab:activated', { doc: d });
 }
 
 export function centerLine(n) {
@@ -213,18 +300,43 @@ export function centerLine(n) {
   vp.scrollTop = Math.max(0, y);
 }
 
+// Registered with diff.js (setSourceJumpHandler): leaves diff view for the
+// plain source view of the doc already open in the active tab, caret and
+// scroll landing on the given working-tree line -- what a click on a diff
+// line number, or the Source toggle, hands over.
+export function jumpToSourceLine(line) {
+  const d = doc_();
+  if (!d || !line) return;
+  setDiffMode('source');
+  d.cur = Math.max(1, Math.min(d.total || line, line));
+  centerLine(d.cur);
+  render();
+  updateStatus();
+  pushHistory(d.path, d.cur);
+}
+
 export function closeTab(i) {
+  if (!S.tabs[i]) return;
+  closeTabs([i]);
+}
+
+function closeTabs(indices) {
+  if (!indices.length) return;
+  // Descending indices stay valid as tabs are removed.
+  indices.sort((a, b) => b - a);
+  closeTabMenu();
   clearSelectAll();
-  const [closed] = S.tabs.splice(i, 1);
-  if (closed) {
+  const activeDoc = doc_();
+  if (activeDoc) activeDoc.scrollTop = vp.scrollTop;
+  const closedEvents = [];
+  const evictions = [];
+  for (const i of indices) {
+    const [closed] = S.tabs.splice(i, 1);
+    if (!closed) continue;
     if (closed.path) {
-      // The active tab's scrollTop is only saved on switch, so read the live one.
-      const scrollTop = i === S.active ? vp.scrollTop : closed.scrollTop;
-      closedTabs.push({ path: closed.path, cur: closed.cur, scrollTop });
+      closedTabs.push({ path: closed.path, cur: closed.cur, scrollTop: closed.scrollTop });
       if (closedTabs.length > MAX_CLOSED) closedTabs.shift();
-      api('/api/close', { path: closed.path })
-        .then(() => refreshMetrics())
-        .catch(() => {});
+      evictions.push(api('/api/close', { path: closed.path }));
     }
     // Release large arrays to assist garbage collection
     closed.lines = null;
@@ -232,22 +344,38 @@ export function closeTab(i) {
     closed.pending?.clear?.();
     closed.refining?.clear?.();
     closed.outline = null;
+    if (i < S.active) {
+      S.active--;
+    } else if (i === S.active) {
+      S.active = Math.min(i, S.tabs.length - 1);
+    }
+    closedEvents.push({ doc: closed, index: i });
   }
+  Promise.allSettled(evictions).then(results => {
+    if (results.some(result => result.status === 'fulfilled')) refreshMetrics();
+  });
   if (S.tabs.length === 0) {
     S.active = -1;
+    syncImageView();
     syncPreview();
     syncDiffView();
     rowsEl.innerHTML = ''; sizer.style.height = '0px';
     $('#empty').hidden = false; drawCrumbs();
     drawTabs(); updateStatus();
+    saveWorkspaceState();
+    for (const event of closedEvents) emit('tab:closed', event);
+    emit('tabs:cleared');
     return;
   }
-  S.active = Math.min(i, S.tabs.length - 1);
   const d = doc_();
+  syncImageView();
   syncPreview();
   syncDiffView();
   drawTabs(); drawCrumbs(); layout();
   vp.scrollTop = d.scrollTop; render(); updateStatus();
+  saveWorkspaceState();
+  for (const event of closedEvents) emit('tab:closed', event);
+  if (d) emit('tab:activated', { doc: d });
 }
 
 // Reopens the most recently closed file that is not open already, where it was left.
@@ -265,8 +393,10 @@ export async function reopenClosedTab() {
 
 export function drawTabs() {
   $('#tabs').innerHTML = S.tabs.map((t, i) =>
-    '<div class="tab' + (i === S.active ? ' active' : '') + '" data-i="' + i + '" title="' + esc(t.path) + '">' +
-    '<span class="tn">' + esc(t.name) + '</span><span class="x" data-close="' + i + '" title="' + withKeys('Close tab ({Alt+W})') + '"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6"/></svg></span></div>').join('');
+    '<div class="tab' + (i === S.active ? ' active' : '') + (t.isImage ? ' tab-image' : '') + '" data-i="' + i + '" title="' + esc(t.path) + '">' +
+    (t.isImage ? '<svg class="tab-icon" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2" width="12" height="12" rx="2"/><circle cx="5.5" cy="5.5" r="1.5"/><path d="M14 10l-3.5-3.5L3 14"/></svg>' : '') +
+    '<span class="tn">' + esc(t.name) + '</span>' +
+    '<span class="x" data-close="' + i + '" title="' + withKeys('Close tab ({Alt+W})') + '"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M2 2l6 6M8 2l-6 6"/></svg></span></div>').join('');
   const act = $('#tabs .tab.active');
   if (act) act.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
@@ -277,6 +407,13 @@ export function switchTab(i) {
   const prev = doc_();
   if (prev) prev.scrollTop = vp.scrollTop;
   S.active = i;
+  const curDoc = S.tabs[i];
+  if (curDoc && curDoc.diffAvailable && (treeEl?.classList.contains('changed-only') || (!curDoc.diffDismissed && curDoc.diffMode === null))) {
+    curDoc.diffMode = layoutPref() || 'split';
+    curDoc.diffDismissed = false;
+    curDoc.openedInDiffView = true;
+  }
+  syncImageView();
   syncPreview();
   syncDiffView();
   clearFind();
@@ -292,6 +429,35 @@ export function switchTab(i) {
   if ($('#panel-outline')?.classList.contains('active')) loadOutline();
   pushHistory(S.tabs[i].path, S.tabs[i].cur);
   revealFile(S.tabs[i].path);
+  saveWorkspaceState();
+  emit('tab:activated', { doc: S.tabs[i], prevDoc: prev });
+}
+
+let saveSessionTimer = null;
+export function saveWorkspaceState() {
+  if (saveSessionTimer) clearTimeout(saveSessionTimer);
+  saveSessionTimer = setTimeout(async () => {
+    try {
+      const tabs = S.tabs.map(t => ({ path: t.path }));
+      await apiPostJson('/api/session', { tabs, active: S.active });
+    } catch {}
+  }, 200);
+}
+
+export async function restoreWorkspaceTabs() {
+  try {
+    const session = await api('/api/session');
+    if (!session || !Array.isArray(session.tabs) || session.tabs.length === 0) return false;
+    for (const t of session.tabs) {
+      if (t.path) await openFile(t.path, { push: false });
+    }
+    if (typeof session.active === 'number' && session.active >= 0 && session.active < S.tabs.length) {
+      switchTab(session.active);
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function drawCrumbs() {
@@ -300,21 +466,30 @@ export function drawCrumbs() {
 }
 
 export function showImage(path) {
-  hideImage();
-  const box = document.createElement('div');
-  box.id = 'imgview';
-  box.innerHTML = '<img src="/api/raw?path=' + encodeURIComponent(path) + '" alt="">';
-  editor.appendChild(box);
-  $('#empty').hidden = true;
+  openFile(path);
 }
 
 export function hideImage() {
   const b = $('#imgview');
-  if (b) b.remove();
+  if (b) b.hidden = true;
 }
 
 export function initTabs() {
+  setSourceJumpHandler(jumpToSourceLine);
+  tabMenu = document.createElement('div');
+  tabMenu.id = 'tab-menu';
+  tabMenu.setAttribute('role', 'menu');
+  tabMenu.hidden = true;
+  document.body.append(tabMenu);
+  tabMenu.addEventListener('click', e => {
+    const button = e.target.closest('[data-tab-action]');
+    if (!button || button.disabled) return;
+    const index = tabMenuIndex;
+    closeTabMenu();
+    closeTabsForAction(button.dataset.tabAction, index);
+  });
   $('#tabs').addEventListener('click', e => {
+    closeTabMenu();
     const x = e.target.closest('[data-close]');
     if (x) { closeTab(+x.dataset.close); return; }
     const t = e.target.closest('.tab');
@@ -324,6 +499,19 @@ export function initTabs() {
     const t = e.target.closest('.tab');
     if (t && e.button === 1) { e.preventDefault(); closeTab(+t.dataset.i); }
   });
+  $('#tabs').addEventListener('contextmenu', e => {
+    const tab = e.target.closest('.tab');
+    if (!tab) { closeTabMenu(); return; }
+    e.preventDefault();
+    openTabMenu(+tab.dataset.i, e.clientX, e.clientY);
+  });
+  document.addEventListener('mousedown', e => {
+    if (tabMenu && !tabMenu.hidden && !tabMenu.contains(e.target)) closeTabMenu();
+  }, true);
+  addEventListener('keydown', e => { if (e.key === 'Escape') closeTabMenu(); });
+  addEventListener('resize', closeTabMenu);
+  addEventListener('blur', closeTabMenu);
+  document.addEventListener('scroll', closeTabMenu, true);
   const crumbsEl = $('#crumbs');
   if (crumbsEl) {
     crumbsEl.addEventListener('click', e => {

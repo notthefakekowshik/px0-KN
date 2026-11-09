@@ -11,13 +11,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import zlib from 'node:zlib';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 const srcDir = path.join(rootDir, 'web', 'src');
-const entryFile = path.join(srcDir, 'main.js');
-const outFile = path.join(rootDir, 'web', 'app.js');
+// Each entry is bundled on its own: the app, and the workbench page that a
+// bare `px0` serves (workbench.go), which shares only a few small modules.
+const bundles = [
+  { entry: path.join(srcDir, 'main.js'), out: path.join(rootDir, 'web', 'app.js') },
+  { entry: path.join(srcDir, 'workbench.js'), out: path.join(rootDir, 'web', 'workbench.js') },
+];
 
 function hasBun() {
   try {
@@ -28,26 +33,33 @@ function hasBun() {
   }
 }
 
-function buildWithBun() {
-  console.log('[build-web] Bundling with Bun...');
+function buildWithBun(entryFile, outFile) {
+  console.log(`[build-web] Bundling ${path.basename(entryFile)} with Bun...`);
   execFileSync('bun', [
     'build',
     entryFile,
     `--outfile=${outFile}`,
     '--target=browser',
-    '--format=iife'
+    '--format=iife',
+    '--minify'
   ], {
     cwd: rootDir,
     stdio: 'inherit'
   });
+  try {
+    execFileSync(process.execPath, ['--check', outFile], { stdio: 'pipe' });
+  } catch (err) {
+    console.error(`[build-web] Syntax error in generated bundle ${path.basename(outFile)}:`, err.stderr?.toString() || err.message);
+    process.exit(1);
+  }
 }
 
 /**
  * Fallback bundler using pure Node.js if Bun is not installed.
  * Recursively resolves local ES module imports and emits an IIFE bundle.
  */
-function buildWithNode() {
-  console.log('[build-web] Bundling with Node.js fallback...');
+function buildWithNode(entryFile, outFile) {
+  console.log(`[build-web] Bundling ${path.basename(entryFile)} with Node.js fallback...`);
   const visited = new Set();
   const moduleOrder = [];
 
@@ -93,13 +105,14 @@ function buildWithNode() {
       else declaredIn.set(m[1], rel);
     }
 
-    // Strip ES import declarations
-    src = src.replace(/^\s*import\s+.*?;?\s*$/gm, '');
+    // Strip ES import declarations (single and multi-line)
+    src = src.replace(/^\s*import(?:\s+[\s\S]*?from\s+)?\s*['"][^'"]+['"];?\s*$/gm, '');
 
     // Replace `export const X =` / `export function X(` / `export async function X(` / `export let X`
     src = src.replace(/^\s*export\s+(?:async\s+)?function\s+/gm, (m) => m.replace('export ', ''));
     src = src.replace(/^\s*export\s+(const|let|var)\s+/gm, '$1 ');
-    src = src.replace(/^\s*export\s*\{[^}]*\};?\s*$/gm, '');
+    src = src.replace(/^\s*export\s*\{[\s\S]*?\}(?:\s*from\s*['"][^'"]+['"])?;?\s*$/gm, '');
+    src = src.replace(/^\s*export\s+\*\s+from\s+['"][^'"]+['"];?\s*$/gm, '');
     src = src.replace(/^\s*export\s+default\s+.*?;?\s*$/gm, '');
 
     combined += `// --- File: ${rel} ---\n` + src.trim() + '\n\n';
@@ -113,20 +126,51 @@ function buildWithNode() {
 
   combined += '})();\n';
   fs.writeFileSync(outFile, combined, 'utf8');
+
+  try {
+    execFileSync(process.execPath, ['--check', outFile], { stdio: 'pipe' });
+  } catch (err) {
+    console.error(`[build-web] Syntax error in generated bundle ${path.basename(outFile)}:`, err.stderr?.toString() || err.message);
+    process.exit(1);
+  }
+}
+
+/**
+ * Pre-compresses vendor minified JS assets with gzip to keep the compiled Go
+ * binary small. Replaces uncompressed .min.js files with .min.js.gz.
+ */
+function compressVendorAssets() {
+  const vendorDir = path.join(rootDir, 'web', 'vendor');
+  if (!fs.existsSync(vendorDir)) return;
+  const files = fs.readdirSync(vendorDir);
+  for (const file of files) {
+    if (file.endsWith('.min.js')) {
+      const fullPath = path.join(vendorDir, file);
+      const gzPath = fullPath + '.gz';
+      const content = fs.readFileSync(fullPath);
+      const compressed = zlib.gzipSync(content, { level: 9 });
+      fs.writeFileSync(gzPath, compressed);
+      fs.unlinkSync(fullPath);
+      console.log(`[build-web] Compressed ${path.relative(rootDir, fullPath)} -> ${path.relative(rootDir, gzPath)} (${(content.length / 1024 / 1024).toFixed(2)} MB -> ${(compressed.length / 1024 / 1024).toFixed(2)} MB)`);
+    }
+  }
 }
 
 function run() {
   const start = Date.now();
-  if (hasBun()) {
-    buildWithBun();
-  } else {
-    buildWithNode();
+  const bun = hasBun();
+  for (const { entry, out } of bundles) {
+    if (bun) buildWithBun(entry, out);
+    else buildWithNode(entry, out);
   }
+  compressVendorAssets();
 
-  const stat = fs.statSync(outFile);
-  const sizeKb = (stat.size / 1024).toFixed(1);
   const duration = Date.now() - start;
-  console.log(`[build-web] Successfully built ${path.relative(rootDir, outFile)} (${sizeKb} KB) in ${duration}ms`);
+  for (const { out } of bundles) {
+    const sizeKb = (fs.statSync(out).size / 1024).toFixed(1);
+    console.log(`[build-web] Successfully built ${path.relative(rootDir, out)} (${sizeKb} KB)`);
+  }
+  console.log(`[build-web] Done in ${duration}ms`);
 }
 
 run();

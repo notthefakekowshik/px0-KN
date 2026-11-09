@@ -8,7 +8,7 @@ px0 is architected from the ground up as a remote-first code reading environment
 
 Modern software development frequently takes place across cloud instances (AWS EC2, GCP Compute Engine), remote containers, Kubernetes pods, and devboxes. Traditional remote development setups (such as VS Code Remote-SSH, remote X11 forwarding, or VNC) require multi-step authentication setups, background server daemon installations, high CPU overhead, and significant network bandwidth.
 
-px0 simplifies remote code inspection into a single shell command. Because the entire application—Go backend, HTTP server, assets, and frontend—is compiled into one static ~9.5 MB binary with zero external dependencies, you can copy px0 to any remote Linux, macOS, or BSD machine and spin it up instantly. Connecting via Tailscale, WireGuard, private VPCs, or reverse proxies gives you a fluid, graphical code inspection console in your browser.
+px0 simplifies remote code inspection into a single shell command. Because the entire application—Go backend, HTTP server, assets, and frontend—is compiled into one static ~3.5 MB binary with zero external dependencies, you can copy px0 to any remote Linux, macOS, or BSD machine and spin it up instantly. Connecting via Tailscale, WireGuard, private VPCs, or reverse proxies gives you a fluid, graphical code inspection console in your browser.
 
 ---
 
@@ -25,7 +25,7 @@ px0 simplifies remote code inspection into a single shell command. Because the e
   - **DNS Rebinding Defense**: Inspects incoming HTTP `Host` headers to prevent cross-site scripting attacks via malicious DNS records.
   - **Agent Security Restrictions**: Agent editing commands are permitted only over direct IP addresses or `localhost`. Access over external hostnames or tunnel proxies automatically disables agent modifications to protect remote machines.
 - **Direct Terminal Ergonomics**: Launch px0 targeting specific files or line numbers directly from the command line:
-  - `px0` (opens current directory)
+  - `px0` (opens the [review workbench](workbench.md); `px0 .` opens the current directory)
   - `px0 ~/projects/kernel` (opens specified repository)
   - `px0 main.go:42` (opens directly to line 42)
 - **Built-in Self-Updater (`px0 --update`)**: Checks GitHub releases and seamlessly upgrades the single binary in place.

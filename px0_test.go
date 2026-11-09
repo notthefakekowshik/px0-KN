@@ -6,6 +6,8 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -17,86 +19,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"px0/internal/metrics"
+	"px0/internal/render"
+	"px0/internal/settings"
+	"px0/internal/ui"
 )
-
-func TestIgnorePatterns(t *testing.T) {
-	ig := newIgnoreSet([]string{"build/", "*.tmp", "!keep.tmp", "docs/**/draft.md", "/only-root.txt"})
-	cases := []struct {
-		path string
-		dir  bool
-		want bool
-	}{
-		{".git", true, true},
-		{"node_modules", true, true},
-		{"src/main.go", false, false},
-		{"build", true, true},
-		{"build/out.js", false, true},
-		{"a/b/c.tmp", false, true},
-		{"a/b/keep.tmp", false, false},
-		{"docs/x/y/draft.md", false, true},
-		{"docs/draft.md", false, true},
-		{"only-root.txt", false, true},
-		{"sub/only-root.txt", false, false},
-		{"vendor", true, true},
-		{"src/vendor.go", false, false},
-	}
-	for _, c := range cases {
-		if got := ig.match(c.path, c.dir); got != c.want {
-			t.Errorf("match(%q, dir=%v) = %v, want %v", c.path, c.dir, got, c.want)
-		}
-	}
-}
-
-func TestFuzzyRanking(t *testing.T) {
-	paths := []string{
-		"internal/server/http_server.go",
-		"cmd/px0/main.go",
-		"web/app.js",
-		"pkg/util/strings.go",
-		"vendor/github.com/x/http/server.go",
-		"httpserver.go",
-	}
-	files := make([]FileEntry, len(paths))
-	for i, p := range paths {
-		name := p[strings.LastIndex(p, "/")+1:]
-		files[i] = FileEntry{Path: p, Name: name, lower: strings.ToLower(p), nameStart: len(p) - len(name)}
-	}
-
-	got := FuzzyFind(files, "httpserver", 10)
-	if len(got) == 0 {
-		t.Fatal("no matches for httpserver")
-	}
-	if got[0].Path != "httpserver.go" {
-		t.Errorf("best match for httpserver = %q, want httpserver.go", got[0].Path)
-	}
-	// Every returned path must actually contain the query as a subsequence.
-	for _, r := range got {
-		if !subsequence("httpserver", strings.ToLower(r.Path)) {
-			t.Errorf("%q is not a subsequence match", r.Path)
-		}
-		for _, p := range r.Pos {
-			if p < 0 || p >= len(r.Path) {
-				t.Errorf("%q: highlight position %d out of range", r.Path, p)
-			}
-		}
-	}
-	if got := FuzzyFind(files, "zzqq", 10); len(got) != 0 {
-		t.Errorf("expected no matches, got %v", got)
-	}
-	if got := FuzzyFind(files, "appjs", 10); got[0].Path != "web/app.js" {
-		t.Errorf("best match for appjs = %q, want web/app.js", got[0].Path)
-	}
-}
-
-func subsequence(q, s string) bool {
-	i := 0
-	for j := 0; j < len(s) && i < len(q); j++ {
-		if s[j] == q[i] {
-			i++
-		}
-	}
-	return i == len(q)
-}
 
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
@@ -164,6 +92,84 @@ func TestThemesStylesheetJoinsEveryThemeFile(t *testing.T) {
 				t.Errorf("%s: missing required token %s", f, tok)
 			}
 		}
+	}
+}
+
+func TestStaticAssetServing(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// 1. Serving uncompressed assets (e.g. style.css)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/style.css", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("style.css status %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/css") {
+		t.Errorf("style.css content-type: %s", ct)
+	}
+
+	// 2. Serving compressed vendor assets with Accept-Encoding: gzip
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/static/vendor/mermaid-12.0.0.min.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mermaid gzip status %d", rec.Code)
+	}
+	if ce := rec.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Errorf("mermaid content-encoding = %q, want gzip", ce)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/javascript") {
+		t.Errorf("mermaid content-type = %q, want text/javascript", ct)
+	}
+	gzr, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("failed to create gzip reader: %v", err)
+	}
+	decompressed, err := io.ReadAll(gzr)
+	gzr.Close()
+	if err != nil {
+		t.Fatalf("failed to decompress gzip body: %v", err)
+	}
+	if bytes.HasPrefix(decompressed, []byte("\x1f\x8b")) {
+		t.Errorf("decompressed mermaid body is still gzipped (double gzip detected)")
+	}
+	if !strings.HasPrefix(string(decompressed), "\"use strict\";") {
+		t.Errorf("decompressed mermaid body missing expected javascript prefix")
+	}
+	if !strings.Contains(string(decompressed), "mermaid") {
+		t.Errorf("decompressed mermaid body missing 'mermaid' keyword")
+	}
+
+	// 3. Serving compressed vendor assets without Accept-Encoding: gzip (transparent decompression)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/static/vendor/mermaid-12.0.0.min.js", nil)
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mermaid uncompressed status %d", rec.Code)
+	}
+	if ce := rec.Header().Get("Content-Encoding"); ce != "" {
+		t.Errorf("mermaid content-encoding without gzip request = %q, want none", ce)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/javascript") {
+		t.Errorf("mermaid content-type = %q, want text/javascript", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "mermaid") {
+		t.Errorf("uncompressed mermaid body missing 'mermaid' keyword")
+	}
+
+	// 4. Missing static file returns 404
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/nonexistent.js", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("missing asset status = %d, want 404", rec.Code)
+	}
+
+	// 5. Path traversal attempts are rejected (never 200 OK)
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/../server.go", nil))
+	if rec.Code == http.StatusOK {
+		t.Errorf("traversal returned 200 OK")
 	}
 }
 
@@ -310,13 +316,13 @@ func TestChunkedReadsCoverWholeFile(t *testing.T) {
 	s := NewServer(ix, nil)
 
 	var all []string
-	for start := 0; ; start += hlChunk {
+	for start := 0; ; start += render.ChunkLines {
 		_, body := get(t, s, "/api/file?path=big.go&start="+itoa(start))
 		total := int(body["total"].(float64))
 		for _, l := range body["lines"].([]any) {
 			all = append(all, l.(string))
 		}
-		if start+hlChunk >= total {
+		if start+render.ChunkLines >= total {
 			if len(all) != total {
 				t.Fatalf("chunked reads produced %d lines, want %d", len(all), total)
 			}
@@ -341,90 +347,6 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
-}
-
-// The segment fast paths must be indistinguishable from the regexp they
-// replace. This compares the two on every combination of a pattern set and a
-// path set, so a shortcut that is merely "close enough" fails here.
-func TestIgnoreFastPathMatchesRegex(t *testing.T) {
-	patterns := []string{
-		"node_modules", "dist", ".git", "build/", "vendor/", "target",
-		"*.pyc", "*.log", "*.min.js", "*", "*.", ".DS_Store",
-		"a?c", "**", "x**y", "sub/dir", "/rooted.txt", "docs/**/draft.md",
-		"weird name", "dash-name", "dot.name.ext", "UPPER",
-		// anchored shapes, which now take a literal-prefix reject or an exact path
-		"tests/baselines", "tests/baselines/reference", "src/*.ts", "src/**/gen.js",
-		"/built/local", "a/b/c/d", "tests/cases/*/x?.ts", "pkg/*/vendor",
-		// "**/" shapes, which have no literal head and rely on the run filter
-		"**/.vscode/*", "**/node_modules/**", "**/*.generated.ts", "**/a/b",
-		"x/**/y", "*/mid/*", "**/",
-	}
-	paths := []string{
-		"", "a", "node_modules", "node_modules/x.js", "a/node_modules",
-		"a/node_modules/b/c.js", "src/dist", "src/dist/app.js", "dist",
-		"build", "build/out.js", "a/build/b/c", "vendor", "vendor/x",
-		"x.pyc", "a/b/x.pyc", "pyc", ".pyc", "a.min.js", "a/b.min.js",
-		"abc", "a/abc", "axc", "sub/dir", "sub/dir/f", "a/sub/dir",
-		"rooted.txt", "a/rooted.txt", "docs/x/draft.md", "docs/draft.md",
-		"weird name", "weird name/f", "dash-name", "dot.name.ext",
-		"UPPER", "upper", "target", "a/target/b", ".DS_Store", "a/.DS_Store",
-		"x**y", "xzzy", "a/b/c/d/e/f/g",
-		"tests", "tests/baselines", "tests/baselines/reference", "tests/baselines/reference/x.js",
-		"tests/baselinesX", "src/a.ts", "src/a/b.ts", "src/x/gen.js", "src/gen.js",
-		"built/local", "built/local/tsc.js", "builtX/local", "a/b/c/d", "a/b/c/d/e",
-		"tests/cases/foo/x1.ts", "tests/cases/foo/x12.ts", "pkg/a/vendor", "pkg/vendor",
-		".vscode", ".vscode/settings.json", "a/.vscode/x.json", "a/b/.vscode",
-		"node_modules/x", "a/node_modules/b/c", "x.generated.ts", "a/b/x.generated.ts",
-		"a/b", "q/a/b", "x/y", "x/m/y", "x/m/n/y", "p/mid/q", "mid/q", "p/mid",
-	}
-
-	for _, pat := range patterns {
-		for _, dirOnlySuffix := range []string{"", "/"} {
-			full := pat + dirOnlySuffix
-			r, ok := compilePattern(full)
-			if !ok {
-				continue
-			}
-			// Rebuild the same pattern forced onto the regexp path.
-			slow, ok := compileRegexOnly(full)
-			if !ok {
-				t.Fatalf("%q: regex form failed to compile", full)
-			}
-			if r.kind != rkRegex {
-				if slow.re == nil || slow.sub == nil {
-					t.Fatalf("%q: reference rule has no regexps", full)
-				}
-			}
-			for _, p := range paths {
-				for _, isDir := range []bool{false, true} {
-					got := r.hit(p, isDir)
-					want := slow.hit(p, isDir)
-					if got != want {
-						t.Errorf("pattern %q path %q dir=%v: fast=%v regex=%v (kind=%d lit=%q)",
-							full, p, isDir, got, want, r.kind, r.lit)
-					}
-				}
-			}
-		}
-	}
-}
-
-// compileRegexOnly builds the same rule with the segment shortcuts disabled.
-func compileRegexOnly(p string) (rule, bool) {
-	r, ok := compilePattern(p)
-	if !ok {
-		return r, false
-	}
-	if r.kind == rkRegex {
-		return r, true
-	}
-	// Re-derive the regexp form by compiling a pattern that cannot be
-	// shortcut, then transplanting the flags.
-	forced, ok := compilePatternRegex(p)
-	if !ok {
-		return r, false
-	}
-	return forced, true
 }
 
 // A Unicode character whose lowercase form is a different byte length used to
@@ -538,18 +460,6 @@ func TestCloseEndpoint(t *testing.T) {
 		t.Fatalf("file: %d %v", code, body)
 	}
 	abs := filepath.Join(root, "greet.go")
-	cache.mu.Lock()
-	found := false
-	for k := range cache.items {
-		if strings.HasPrefix(k, abs+"|") {
-			found = true
-			break
-		}
-	}
-	cache.mu.Unlock()
-	if !found {
-		t.Fatal("expected greet.go to be in highlight cache")
-	}
 
 	// 2. Call /api/close?path=greet.go
 	code, body = get(t, s, "/api/close?path=greet.go")
@@ -561,16 +471,7 @@ func TestCloseEndpoint(t *testing.T) {
 	}
 
 	// 3. Verify evicted from cache
-	cache.mu.Lock()
-	foundAfter := false
-	for k := range cache.items {
-		if strings.HasPrefix(k, abs+"|") {
-			foundAfter = true
-			break
-		}
-	}
-	cache.mu.Unlock()
-	if foundAfter {
+	if render.Evict(abs) {
 		t.Fatal("expected greet.go to be evicted from highlight cache after /api/close")
 	}
 
@@ -806,6 +707,25 @@ func TestServerBasePathRouting(t *testing.T) {
 	}
 }
 
+func TestNetworkURLs(t *testing.T) {
+	addrs := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+		&net.IPNet{IP: net.ParseIP("10.0.0.4"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("2001:db8::1"), Mask: net.CIDRMask(64, 128)},
+	}
+
+	got := networkURLsFromAddrs("0.0.0.0:7777", "main.go", 42, addrs)
+	want := []string{
+		"http://10.0.0.4:7777?line=42&path=main.go",
+		"http://192.168.1.20:7777?line=42&path=main.go",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("networkURLsFromAddrs = %v, want %v", got, want)
+	}
+}
+
 func TestVersionDrivenFromVERSIONFile(t *testing.T) {
 	data, err := os.ReadFile("VERSION")
 	if err != nil {
@@ -830,11 +750,11 @@ func TestMetaIncludesVersion(t *testing.T) {
 }
 
 func TestVerboseRequestLogging(t *testing.T) {
-	origVerbose := uiVerbose
-	origQuiet := uiQuiet
+	origVerbose := ui.Verbose
+	origQuiet := ui.Quiet
 	defer func() {
-		uiVerbose = origVerbose
-		uiQuiet = origQuiet
+		ui.Verbose = origVerbose
+		ui.Quiet = origQuiet
 	}()
 
 	s, _ := newTestServer(t)
@@ -849,8 +769,8 @@ func TestVerboseRequestLogging(t *testing.T) {
 		os.Stdout = origStdout
 	}()
 
-	uiVerbose = true
-	uiQuiet = false
+	ui.Verbose = true
+	ui.Quiet = false
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/tree", nil)
@@ -951,53 +871,12 @@ func TestUnifiedEventStream(t *testing.T) {
 		t.Fatalf("did not receive initial metrics event on /api/stream")
 	}
 
-	var m ProcessMetrics
+	var m metrics.ProcessMetrics
 	if err := json.Unmarshal([]byte(metricsData), &m); err != nil {
 		t.Fatalf("failed to unmarshal metrics JSON: %v, raw: %s", err, metricsData)
 	}
 	if m.Goroutine <= 0 {
 		t.Errorf("expected goroutines > 0, got %d", m.Goroutine)
-	}
-}
-
-func TestUISpinner(t *testing.T) {
-	origQuiet := uiQuiet
-	defer func() { uiQuiet = origQuiet }()
-	uiQuiet = false
-
-	var buf bytes.Buffer
-	sp := newSpinner("Initial step", &buf)
-	sp.Update("Second step")
-	sp.Success("All done")
-
-	out := buf.String()
-	if !strings.Contains(out, "Initial step") {
-		t.Errorf("expected output to contain 'Initial step', got: %q", out)
-	}
-	if !strings.Contains(out, "Second step") {
-		t.Errorf("expected output to contain 'Second step', got: %q", out)
-	}
-	if !strings.Contains(out, "All done") {
-		t.Errorf("expected output to contain 'All done', got: %q", out)
-	}
-
-	// Test Fail
-	buf.Reset()
-	sp2 := newSpinner("Starting task", &buf)
-	sp2.Fail("Failed task")
-	out2 := buf.String()
-	if !strings.Contains(out2, "Failed task") {
-		t.Errorf("expected output to contain 'Failed task', got: %q", out2)
-	}
-
-	// Test Quiet mode
-	uiQuiet = true
-	buf.Reset()
-	sp3 := newSpinner("Quiet task", &buf)
-	sp3.Update("Quiet update")
-	sp3.Success("Quiet done")
-	if buf.Len() != 0 {
-		t.Errorf("expected quiet mode to produce no output, got: %q", buf.String())
 	}
 }
 
@@ -1124,63 +1003,843 @@ func TestSnipBoundsChecks(t *testing.T) {
 	}
 }
 
-func TestFuzzyCaseSensitivity(t *testing.T) {
-	files := []FileEntry{
-		{Path: "src/HTTPServer.go", Name: "HTTPServer.go", lower: "src/httpserver.go", nameStart: 4},
-		{Path: "src/httpserver.go", Name: "httpserver.go", lower: "src/httpserver.go", nameStart: 4},
+func TestSetRawHeaders(t *testing.T) {
+	cases := []struct {
+		path            string
+		wantContentType string
+		wantFilename    string
+	}{
+		{"index.html", "application/octet-stream", "index.html"},
+		{"app.js", "application/octet-stream", "app.js"},
+		{"main.go", "application/octet-stream", "main.go"},
+		{"nested/path/style.css", "application/octet-stream", "style.css"},
+		{"assets/logo.png", "image/png", "logo.png"},
+		{"assets/photo.jpg", "image/jpeg", "photo.jpg"},
+		{"assets/anim.gif", "image/gif", "anim.gif"},
+		{"assets/vector.svg", "image/svg+xml", "vector.svg"},
+		{"assets/icon.ico", "image/x-icon", "icon.ico"},
+		{"assets/pic.webp", "image/webp", "pic.webp"},
 	}
 
-	// Uppercase query should rank exact-case match higher
-	res := FuzzyFind(files, "HTTPServer", 10)
-	if len(res) < 2 {
-		t.Fatalf("expected 2 results, got %d", len(res))
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		setRawHeaders(rec, c.path)
+
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: got nosniff header %q, want 'nosniff'", c.path, got)
+		}
+
+		gotCT := rec.Header().Get("Content-Type")
+		if strings.HasPrefix(c.wantContentType, "image/") {
+			if !strings.HasPrefix(gotCT, "image/") {
+				t.Errorf("%s: got Content-Type %q, want image/*", c.path, gotCT)
+			}
+		} else if gotCT != c.wantContentType {
+			t.Errorf("%s: got Content-Type %q, want %q", c.path, gotCT, c.wantContentType)
+		}
+
+		gotCD := rec.Header().Get("Content-Disposition")
+		if !strings.HasPrefix(gotCD, "attachment") || !strings.Contains(gotCD, c.wantFilename) {
+			t.Errorf("%s: got Content-Disposition %q, expected attachment containing %q", c.path, gotCD, c.wantFilename)
+		}
 	}
-	if res[0].Path != "src/HTTPServer.go" {
-		t.Errorf("expected 'src/HTTPServer.go' to rank higher for query 'HTTPServer', got: %s", res[0].Path)
+}
+
+func TestRawEndpointHeaders(t *testing.T) {
+	s, root := newTestServer(t)
+
+	// Create test files
+	files := map[string]string{
+		"evil.html": "<!DOCTYPE html><html><script>alert(1)</script></html>",
+		"icon.svg":  `<svg xmlns="http://www.w3.org/2000/svg"><circle r="10"/></svg>`,
+		"data.json": `{"foo": "bar"}`,
+	}
+	for rel, content := range files {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		rel             string
+		wantContentType string
+		wantDisposition string
+	}{
+		{"main.go", "application/octet-stream", "main.go"},
+		{"evil.html", "application/octet-stream", "evil.html"},
+		{"data.json", "application/octet-stream", "data.json"},
+		{"icon.svg", "image/svg+xml", "icon.svg"},
+	}
+
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/raw?path="+url.QueryEscape(tc.rel), nil)
+		s.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d (body: %s)", tc.rel, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", tc.rel, got)
+		}
+		if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, tc.wantContentType) {
+			t.Errorf("%s: Content-Type = %q, want %q", tc.rel, got, tc.wantContentType)
+		}
+		if got := rec.Header().Get("Content-Disposition"); !strings.Contains(got, tc.wantDisposition) {
+			t.Errorf("%s: Content-Disposition = %q, want %q", tc.rel, got, tc.wantDisposition)
+		}
+	}
+}
+
+func TestContentSecurityPolicyHeader(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	endpoints := []string{"/", "/api/meta", "/api/raw?path=main.go"}
+	for _, ep := range endpoints {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, ep, nil)
+		s.ServeHTTP(rec, req)
+
+		csp := rec.Header().Get("Content-Security-Policy")
+		if csp == "" {
+			t.Fatalf("%s: missing Content-Security-Policy header", ep)
+		}
+		if csp != contentSecurityPolicy {
+			t.Errorf("%s: got CSP %q, want %q", ep, csp, contentSecurityPolicy)
+		}
+
+		requiredDirectives := []string{
+			"default-src 'self'",
+			"script-src 'self'",
+			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+			"font-src 'self' https://fonts.gstatic.com",
+			"img-src 'self' data: https: http:",
+			"connect-src 'self'",
+			"object-src 'none'",
+			"base-uri 'self'",
+			"frame-ancestors 'none'",
+			"form-action 'none'",
+		}
+		for _, dir := range requiredDirectives {
+			if !strings.Contains(csp, dir) {
+				t.Errorf("%s: CSP missing directive %q", ep, dir)
+			}
+		}
+	}
+}
+
+func TestFileSave(t *testing.T) {
+	s, root := newTestServer(t)
+
+	// 1. Save changes to existing file
+	newContent := "package main\n\nfunc main() {\n\tgreet(\"updated\")\n}\n"
+	body, _ := json.Marshal(map[string]string{
+		"path":    "main.go",
+		"content": newContent,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/file/save", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	diskBytes, err := os.ReadFile(filepath.Join(root, "main.go"))
+	if err != nil {
+		t.Fatalf("failed to read disk file: %v", err)
+	}
+	if string(diskBytes) != newContent {
+		t.Fatalf("file content mismatch: got %q, want %q", string(diskBytes), newContent)
+	}
+
+	// 2. Reject path traversal
+	body, _ = json.Marshal(map[string]string{
+		"path":    "../../escape.txt",
+		"content": "bad",
+	})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/file/save", bytes.NewReader(body))
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for path traversal, got %d", rec.Code)
+	}
+
+	// 3. Reject directory target
+	body, _ = json.Marshal(map[string]string{
+		"path":    "sub",
+		"content": "bad",
+	})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/file/save", bytes.NewReader(body))
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for directory target, got %d", rec.Code)
+	}
+}
+
+func TestFSNew(t *testing.T) {
+	s, root := newTestServer(t)
+
+	// 1. Create new file with nested directory
+	body, _ := json.Marshal(map[string]string{
+		"path": "pkg/nested/new_file.go",
+		"type": "file",
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/fs/new", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	targetPath := filepath.Join(root, "pkg", "nested", "new_file.go")
+	st, err := os.Stat(targetPath)
+	if err != nil {
+		t.Fatalf("expected file to exist at %s: %v", targetPath, err)
+	}
+	if st.IsDir() {
+		t.Fatalf("expected regular file, got directory")
+	}
+
+	// 2. Creating already existing file should fail with 409 Conflict
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/fs/new", bytes.NewReader(body))
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict, got %d", rec.Code)
+	}
+
+	// 3. Create new directory
+	body, _ = json.Marshal(map[string]string{
+		"path": "src/components",
+		"type": "dir",
+	})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/fs/new", bytes.NewReader(body))
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	dirPath := filepath.Join(root, "src", "components")
+	st, err = os.Stat(dirPath)
+	if err != nil || !st.IsDir() {
+		t.Fatalf("expected directory to exist at %s", dirPath)
+	}
+
+	// 4. Reject traversal
+	body, _ = json.Marshal(map[string]string{
+		"path": "../evil",
+		"type": "file",
+	})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/fs/new", bytes.NewReader(body))
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for path traversal, got %d", rec.Code)
+	}
+}
+
+func TestTableEndpointServesRowsAndFileFlagsTables(t *testing.T) {
+	t.Parallel()
+	s, root := newTestServer(t)
+	if err := os.WriteFile(filepath.Join(root, "bench.csv"), []byte("repo,files\nlinux,81902\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bench.tsv"), []byte("repo\tfiles\nlinux\t81902\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, m := get(t, s, "/api/table?path=bench.csv")
+	if code != 200 {
+		t.Fatalf("status %d: %v", code, m)
+	}
+	rows, _ := m["rows"].([]any)
+	if len(rows) != 1 || m["cols"] != float64(2) {
+		t.Errorf("response = %v", m)
+	}
+	for path, want := range map[string]bool{"bench.csv": true, "bench.tsv": true, "main.go": false} {
+		if _, m := get(t, s, "/api/file?path="+path); m["table"] != want {
+			t.Errorf("%s: table = %v, want %v", path, m["table"], want)
+		}
+	}
+	if code, _ := get(t, s, "/api/table?path=main.go"); code != 415 {
+		t.Errorf("non-table file: status %d, want 415", code)
+	}
+}
+
+func TestMarkdownPreview(t *testing.T) {
+	t.Parallel()
+	s, root := newTestServer(t)
+	src := "# Hello World\n\nSee [deep](sub/deep.py#L2).\n\n## API_reference\n\n```go\nfunc main() {}\n```\n\n- [x] done\n"
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, m := get(t, s, "/api/markdown?path=README.md")
+	if code != 200 {
+		t.Fatalf("status %d: %v", code, m)
+	}
+	out, _ := m["html"].(string)
+	for _, want := range []string{
+		`<h1 id="hello-world" data-line="1">Hello World</h1>`,
+		`<h2 id="api_reference" data-line="5">`,
+		`<pre class="md-code" data-line="8" data-lang="go"><code><i class=k>func</i>`,
+		`<a href="sub/deep.py#L2">deep</a>`,
+		`type="checkbox"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("preview is missing %q:\n%s", want, out)
+		}
+	}
+
+	if _, m := get(t, s, "/api/file?path=README.md"); m["markdown"] != true {
+		t.Errorf("file response should flag Markdown, got %v", m["markdown"])
+	}
+	if code, _ := get(t, s, "/api/markdown?path=main.go"); code != 415 {
+		t.Errorf("non-Markdown file: status %d, want 415", code)
+	}
+	if code, _ := get(t, s, "/api/markdown?path=../x.md"); code != 400 {
+		t.Errorf("path outside the root: status %d, want 400", code)
+	}
+}
+
+func TestSettingsAPIEndpoints(t *testing.T) {
+	isolateSettings(t)
+	root := t.TempDir()
+	srv := agentServer(t, root, "echo")
+
+	// 1. GET /api/settings
+	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/settings failed: code %d, body: %s", rec.Code, rec.Body.String())
+	}
+	var getResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("invalid GET json response: %v", err)
+	}
+	if _, ok := getResp["schema"]; !ok {
+		t.Errorf("missing schema in GET /api/settings response")
+	}
+
+	// 2. POST /api/settings with key/value updates
+	payload := map[string]any{
+		"editor.tabSize":              2,
+		"diffEditor.renderSideBySide": false,
+	}
+	b, _ := json.Marshal(payload)
+	postReq := httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewReader(b))
+	postReq.Host = "127.0.0.1:7777"
+	postReq.Header.Set("Origin", "http://127.0.0.1:7777")
+	postReq.Header.Set("Content-Type", "application/json")
+	postRec := httptest.NewRecorder()
+	srv.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusOK {
+		t.Fatalf("POST /api/settings failed: code %d, body: %s", postRec.Code, postRec.Body.String())
+	}
+
+	// 3. Verify changes persisted
+	m := settings.ReadMergedMap()
+	if m["editor.tabSize"] != float64(2) && m["editor.tabSize"] != 2 {
+		t.Errorf("expected editor.tabSize 2, got %v", m["editor.tabSize"])
+	}
+	if m["diffEditor.renderSideBySide"] != false {
+		t.Errorf("expected diffEditor.renderSideBySide false, got %v", m["diffEditor.renderSideBySide"])
+	}
+
+	// 4. POST /api/settings with raw JSON
+	rawPayload := map[string]any{
+		"raw": "{\n  \"editor.fontSize\": 15,\n  \"workbench.colorTheme\": \"nord\"\n}\n",
+	}
+	rb, _ := json.Marshal(rawPayload)
+	rawReq := httptest.NewRequest(http.MethodPost, "/api/settings", bytes.NewReader(rb))
+	rawReq.Host = "127.0.0.1:7777"
+	rawReq.Header.Set("Origin", "http://127.0.0.1:7777")
+	rawReq.Header.Set("Content-Type", "application/json")
+	rawRec := httptest.NewRecorder()
+	srv.ServeHTTP(rawRec, rawReq)
+	if rawRec.Code != http.StatusOK {
+		t.Fatalf("POST /api/settings raw failed: code %d, body: %s", rawRec.Code, rawRec.Body.String())
+	}
+
+	m2 := settings.ReadMergedMap()
+	if m2["editor.fontSize"] != float64(15) && m2["editor.fontSize"] != 15 {
+		t.Errorf("expected editor.fontSize 15 from raw, got %v", m2["editor.fontSize"])
+	}
+	if m2["workbench.colorTheme"] != "nord" {
+		t.Errorf("expected workbench.colorTheme nord from raw, got %v", m2["workbench.colorTheme"])
 	}
 }
 
 func TestHTMLPreviewEndpoints(t *testing.T) {
 	s, root := newTestServer(t)
-	htmlContent := "<!DOCTYPE html><html><body><h1>Hello HTML</h1></body></html>"
-	p := filepath.Join(root, "page.html")
-	if err := os.WriteFile(p, []byte(htmlContent), 0o644); err != nil {
-		t.Fatal(err)
+	page := "<!DOCTYPE html><html><body><h1>Hello HTML</h1><script>alert(1)</script></body></html>"
+	for rel, body := range map[string]string{
+		"page.html":      page,
+		"sub/index.html": page,
+		"sub/style.css":  "h1 { color: red }",
+		"sub/app.js":     "alert(1)",
+		"sub/notes.txt":  "text",
+	} {
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(abs, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// 1. /api/file should identify html: true
 	code, body := get(t, s, "/api/file?path=page.html")
 	if code != http.StatusOK {
-		t.Fatalf("expected 200 from /api/file, got %d: %v", code, body)
+		t.Fatalf("/api/file: got %d: %v", code, body)
 	}
-	if isHtml, ok := body["html"].(bool); !ok || !isHtml {
+	if isHTML, ok := body["html"].(bool); !ok || !isHTML {
 		t.Errorf("expected html: true in /api/file, got %v", body["html"])
 	}
 
-	// 2. /api/raw?path=page.html serves raw HTML
-	rec1 := httptest.NewRecorder()
-	s.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/api/raw?path=page.html", nil))
-	if rec1.Code != http.StatusOK {
-		t.Fatalf("expected 200 from /api/raw?path=page.html, got %d", rec1.Code)
-	}
-	if !strings.Contains(rec1.Body.String(), "Hello HTML") {
-		t.Errorf("expected body to contain 'Hello HTML', got %q", rec1.Body.String())
-	}
-	if ct := rec1.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-		t.Errorf("expected Content-Type text/html, got %q", ct)
+	fetch := func(url string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+		return rec
 	}
 
-	// 3. /api/raw/page.html path-based routing serves the same file
-	rec2 := httptest.NewRecorder()
-	s.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/raw/page.html", nil))
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("expected 200 from /api/raw/page.html, got %d", rec2.Code)
+	// A page renders inline, sandboxed, and only px0 may frame it. index.html
+	// must not be redirected away the way http.ServeFile would.
+	for _, url := range []string{"/api/htmlpreview/page.html", "/api/htmlpreview/sub/index.html"} {
+		rec := fetch(url)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Hello HTML") {
+			t.Fatalf("%s: got %d %q", url, rec.Code, rec.Body.String())
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+			t.Errorf("%s: Content-Type = %q", url, ct)
+		}
+		if cd := rec.Header().Get("Content-Disposition"); cd != "" {
+			t.Errorf("%s: Content-Disposition = %q, want inline", url, cd)
+		}
+		csp := rec.Header().Get("Content-Security-Policy")
+		for _, want := range []string{"sandbox", "default-src 'none'", "frame-ancestors 'self'"} {
+			if !strings.Contains(csp, want) {
+				t.Errorf("%s: CSP %q missing %q", url, csp, want)
+			}
+		}
+		if strings.Contains(csp, "allow-scripts") || strings.Contains(csp, "script-src") {
+			t.Errorf("%s: CSP %q must not permit script", url, csp)
+		}
 	}
-	if !strings.Contains(rec2.Body.String(), "Hello HTML") {
-		t.Errorf("expected body to contain 'Hello HTML', got %q", rec2.Body.String())
+
+	if rec := fetch("/api/htmlpreview/sub/style.css"); rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/css") {
+		t.Errorf("stylesheet: got %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	for url, want := range map[string]int{
+		"/api/htmlpreview/sub/app.js":    http.StatusUnsupportedMediaType,
+		"/api/htmlpreview/sub/notes.txt": http.StatusUnsupportedMediaType,
+		"/api/htmlpreview/missing.html":  http.StatusNotFound,
+	} {
+		if rec := fetch(url); rec.Code != want {
+			t.Errorf("%s: got %d, want %d", url, rec.Code, want)
+		}
+	}
+
+	// /api/raw keeps upstream's download-only hardening.
+	rec := fetch("/api/raw?path=page.html")
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("/api/raw Content-Type = %q", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment") {
+		t.Errorf("/api/raw Content-Disposition = %q", cd)
 	}
 }
 
 
 
 
+
+// ---------------------------------------------------------------- Session tests
+
+func TestSessionAPIEndpoints(t *testing.T) {
+	// Isolate session path to a temp dir
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmpDir)
+
+	root := t.TempDir()
+	ix := NewIndex(root)
+	s := NewServer(ix, nil, "/rev-999/")
+
+	// 1. GET /rev-999/api/session initially
+	req := httptest.NewRequest(http.MethodGet, "/rev-999/api/session", nil)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /rev-999/api/session failed: code %d, body %s", rec.Code, rec.Body.String())
+	}
+	var initResp WorkspaceSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &initResp); err != nil {
+		t.Fatalf("unmarshal session failed: %v", err)
+	}
+	if len(initResp.Tabs) != 0 {
+		t.Errorf("expected 0 tabs initially, got %d", len(initResp.Tabs))
+	}
+
+	// 2. POST /rev-999/api/session with tabs and openDirs
+	active := 1
+	payload := map[string]any{
+		"tabs": []map[string]string{
+			{"path": "foo.go"},
+			{"path": "bar.go"},
+		},
+		"active":   active,
+		"openDirs": []string{"pkg", "cmd"},
+	}
+	b, _ := json.Marshal(payload)
+	postReq := httptest.NewRequest(http.MethodPost, "/rev-999/api/session", bytes.NewReader(b))
+	postReq.Host = "127.0.0.1:7777"
+	postReq.Header.Set("Origin", "http://127.0.0.1:7777")
+	postReq.Header.Set("Content-Type", "application/json")
+	postRec := httptest.NewRecorder()
+	s.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusOK {
+		t.Fatalf("POST /rev-999/api/session failed: code %d, body %s", postRec.Code, postRec.Body.String())
+	}
+
+	// 3. Verify file was written to disk under rev-999.json
+	sessFile := filepath.Join(tmpDir, "px0", "sessions", "rev-999.json")
+	if _, err := os.Stat(sessFile); err != nil {
+		t.Fatalf("session file not found on disk: %v", err)
+	}
+
+	// 4. Create a new server instance with same basePath and check that state is restored
+	s2 := NewServer(ix, nil, "/rev-999/")
+	sess2 := s2.session.Get()
+	if len(sess2.Tabs) != 2 {
+		t.Fatalf("expected 2 tabs in restored session, got %d", len(sess2.Tabs))
+	}
+	if sess2.Tabs[0].Path != "foo.go" || sess2.Tabs[1].Path != "bar.go" {
+		t.Errorf("unexpected tab paths: %+v", sess2.Tabs)
+	}
+	if sess2.Active != 1 {
+		t.Errorf("expected active tab 1, got %d", sess2.Active)
+	}
+	if len(sess2.OpenDirs) != 2 || sess2.OpenDirs[0] != "pkg" || sess2.OpenDirs[1] != "cmd" {
+		t.Errorf("unexpected openDirs: %+v", sess2.OpenDirs)
+	}
+}
+
+func TestPRDraftSessionPersistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmpDir)
+
+	root := t.TempDir()
+	ix := NewIndex(root)
+	s := NewServer(ix, nil, "/rev-42/")
+	pr := &prSession{
+		diffBase: "HEAD",
+	}
+	s.SetPR(pr)
+
+	// Add a draft comment via POST /rev-42/api/pr/comments
+	payload := map[string]any{
+		"path": "main.go",
+		"line": 25,
+		"side": "RIGHT",
+		"body": "Check this line",
+	}
+	b, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/rev-42/api/pr/comments", bytes.NewReader(b))
+	req.Host = "127.0.0.1:7777"
+	req.Header.Set("Origin", "http://127.0.0.1:7777")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /rev-42/api/pr/comments failed: code %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	// Create a second server instance simulating a restart
+	s2 := NewServer(ix, nil, "/rev-42/")
+	pr2 := &prSession{
+		diffBase: "HEAD",
+	}
+	s2.SetPR(pr2)
+
+	// Verify drafts were restored in pr2
+	pr2.mu.Lock()
+	defer pr2.mu.Unlock()
+	if len(pr2.comments) != 1 {
+		t.Fatalf("expected 1 restored draft comment, got %d", len(pr2.comments))
+	}
+	if pr2.comments[0].Path != "main.go" || pr2.comments[0].Body != "Check this line" {
+		t.Errorf("unexpected restored comment: %+v", pr2.comments[0])
+	}
+}
+
+func postDraft(t *testing.T, s *Server, prefix, body string) {
+	t.Helper()
+	b, _ := json.Marshal(map[string]any{"path": "main.go", "line": 25, "side": "RIGHT", "body": body})
+	req := httptest.NewRequest(http.MethodPost, prefix+"/api/pr/comments", bytes.NewReader(b))
+	req.Host = "127.0.0.1:7777"
+	req.Header.Set("Origin", "http://127.0.0.1:7777")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST %s/api/pr/comments failed: code %d, body %s", prefix, rec.Code, rec.Body.String())
+	}
+}
+
+// A direct `px0 <pr-url>` run has no base path and checks out into a new
+// temporary directory each time; drafts must still come back.
+func TestPRDraftsSurviveNewCheckoutRoot(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	pt := PRTarget{Provider: "github", Owner: "acme", Repo: "widget", Number: 7}
+
+	s := NewServer(NewIndex(t.TempDir()), nil)
+	s.SetPR(&prSession{diffBase: "HEAD", target: pt})
+	postDraft(t, s, "", "first run")
+
+	s2 := NewServer(NewIndex(t.TempDir()), nil)
+	pr2 := &prSession{diffBase: "HEAD", target: pt}
+	s2.SetPR(pr2)
+	if len(pr2.comments) != 1 || pr2.comments[0].Body != "first run" {
+		t.Fatalf("expected the draft from the earlier run, got %+v", pr2.comments)
+	}
+
+	other := &prSession{diffBase: "HEAD", target: PRTarget{Provider: "github", Owner: "acme", Repo: "widget", Number: 8}}
+	NewServer(NewIndex(t.TempDir()), nil).SetPR(other)
+	if len(other.comments) != 0 {
+		t.Fatalf("another PR must not see these drafts, got %+v", other.comments)
+	}
+}
+
+// Drafts an older px0 saved under the base-path file move to the PR's file.
+func TestPRDraftsMigrateFromBasePathFile(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	root := t.TempDir()
+	newSessionManager("/w/abc/", root).Update(func(ws *WorkspaceSession) {
+		ws.Drafts = []prComment{{ID: 3, Path: "a.go", Line: 1, Side: "RIGHT", Body: "old"}}
+	})
+
+	pt := PRTarget{Provider: "github", Owner: "acme", Repo: "widget", Number: 7}
+	pr := &prSession{diffBase: "HEAD", target: pt}
+	NewServer(NewIndex(root), nil, "/w/abc/").SetPR(pr)
+	if len(pr.comments) != 1 || pr.comments[0].Body != "old" || pr.nextID != 3 {
+		t.Fatalf("expected the migrated draft, got %+v (nextID %d)", pr.comments, pr.nextID)
+	}
+	if got := newPRSessionManager(pt).Get().Drafts; len(got) != 1 {
+		t.Fatalf("expected the draft in the PR session file, got %+v", got)
+	}
+	if got := newSessionManager("/w/abc/", root).Get().Drafts; len(got) != 0 {
+		t.Fatalf("expected the base-path file's drafts cleared, got %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------- Search cancellation tests
+
+func TestSearchContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 20; i++ {
+		content := "package main\n\nfunc SearchTarget() {}\n"
+		if err := os.WriteFile(filepath.Join(root, "file_"+string(rune('a'+i))+".go"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ix := NewIndex(root)
+	ix.Build()
+
+	// 1. Normal search should find all files
+	res, _, err := SearchContext(context.Background(), ix, SearchOpts{Query: "SearchTarget"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res) != 20 {
+		t.Fatalf("expected 20 file hits, got %d", len(res))
+	}
+
+	// 2. Search with already canceled context returns immediately
+	ctxCanceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err = SearchContext(ctxCanceled, ix, SearchOpts{Query: "SearchTarget"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// 3. Search cancelled while in-flight terminates worker goroutines
+	ctxTimed, cancelTimed := context.WithTimeout(context.Background(), 10*time.Microsecond)
+	defer cancelTimed()
+	_, _, err = SearchContext(ctxTimed, ix, SearchOpts{Query: "SearchTarget"})
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected cancellation or deadline error, got %v", err)
+	}
+}
+
+func TestHandleSearchWithCanceledRequest(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc Hello() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ix := NewIndex(root)
+	ix.Build()
+	s := NewServer(ix, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=Hello", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel() // cancel immediately to simulate aborted request
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	s.handleSearch(rec, req)
+
+	// Since context was canceled, handleSearch should return cleanly without writing a 400 error
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("expected canceled search to return quietly, got status %d", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------- Benchmarks
+
+func BenchmarkSnip(b *testing.B) {
+	rawLine := []byte("    func handleSearchRequest(w http.ResponseWriter, r *http.Request, query string) (SearchResult, error) {")
+	from := 9
+	to := 28
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = snip(rawLine, from, to)
+	}
+}
+
+func BenchmarkSearchLiteralInMemory(b *testing.B) {
+	root := b.TempDir()
+	content := "package main\n\n// TargetSearchToken is here\nfunc TargetSearchToken() string { return \"ok\" }\n"
+	for i := 0; i < 20; i++ {
+		_ = os.WriteFile(filepath.Join(root, fmt.Sprintf("file_%d.go", i)), []byte(content), 0o644)
+	}
+	ix := NewIndex(root)
+	ix.Build()
+
+	opts := SearchOpts{
+		Query:    "TargetSearchToken",
+		MaxFiles: 50,
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = SearchContext(context.Background(), ix, opts)
+	}
+}
+
+func BenchmarkSearchDefWord(b *testing.B) {
+	root := b.TempDir()
+	missContent := strings.Repeat("package main\nfunc helperFunc(x int) int { return x + 1 }\n", 50)
+	for i := 0; i < 40; i++ {
+		_ = os.WriteFile(filepath.Join(root, fmt.Sprintf("miss_%d.go", i)), []byte(missContent), 0o644)
+	}
+	hitContent := "package main\nfunc TargetSymbolDef() string { return \"ok\" }\n"
+	_ = os.WriteFile(filepath.Join(root, "hit.go"), []byte(hitContent), 0o644)
+
+	ix := NewIndex(root)
+	ix.Build()
+
+	opts := SearchOpts{
+		Query:        "TargetSymbolDef",
+		Word:         true,
+		Case:         true,
+		classifyDefs: true,
+		MaxFiles:     50,
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = SearchContext(context.Background(), ix, opts)
+	}
+}
+
+func BenchmarkSortNodes(b *testing.B) {
+	base := make([]Node, 64)
+	for i := range base {
+		base[i] = Node{
+			Name: fmt.Sprintf("File_%02d_Component.go", 64-i),
+			Path: fmt.Sprintf("pkg/File_%02d_Component.go", 64-i),
+			Dir:  i%5 == 0,
+		}
+	}
+	work := make([]Node, len(base))
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		copy(work, base)
+		sortNodes(work)
+	}
+}
+
+func BenchmarkHandleFileScrollChunk(b *testing.B) {
+	wd, err := os.Getwd()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ix := NewIndex(wd)
+	ix.Build()
+	srv := &Server{ix: ix, lsp: newLSPManager(wd, false), diffBase: "HEAD"}
+	req := httptest.NewRequest(http.MethodGet, "/api/file?path=server.go&start=300&count=300", nil)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		w := httptest.NewRecorder()
+		srv.handleFile(w, req)
+	}
+}
+
+func TestFindIndexingStatus(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "testfile.txt"), []byte("hello world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ix := NewIndex(root)
+	srv := NewServer(ix, nil)
+
+	// Before indexing: indexing should be true and files empty
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/find?q=test", nil)
+	srv.handleFind(w, req)
+
+	var payload struct {
+		Results  []any `json:"results"`
+		Indexing bool  `json:"indexing"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode find response: %v", err)
+	}
+	if !payload.Indexing {
+		t.Fatalf("expected indexing: true before build")
+	}
+
+	// Build index
+	ix.Build()
+
+	// After indexing: indexing should be false and results found
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/api/find?q=testfile", nil)
+	srv.handleFind(w2, req2)
+
+	var payload2 struct {
+		Results  []any `json:"results"`
+		Indexing bool  `json:"indexing"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &payload2); err != nil {
+		t.Fatalf("decode find response 2: %v", err)
+	}
+	if payload2.Indexing {
+		t.Fatalf("expected indexing: false after build")
+	}
+	if len(payload2.Results) == 0 {
+		t.Fatalf("expected results after build, got 0")
+	}
+}

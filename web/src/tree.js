@@ -1,8 +1,13 @@
 // web/src/tree.js
 import { $, $$, esc, api, apiPost, apiPostJson, S } from './state.js';
 import { openFile } from './tabs.js';
+import { syncDiffView, focusDiffScope, isFileViewed } from './diff.js';
 import { showToast, copyToClipboard } from './ui.js';
 import { closeSelMenu } from './selbar.js';
+import { emit, on } from './bus.js';
+import { isAutoRevealEnabled } from './settings.js';
+import { promptNewItem } from './newitem.js';
+import { handleGitStatus, triggerRefresh } from './gitstream.js';
 
 export const treeEl = $('#tree');
 const treeMenu = $('#tree-menu');
@@ -10,6 +15,11 @@ let activeTreeTarget = null;
 export const openDirs = new Set();
 // A newer tree action invalidates responses from older directory requests.
 let expansionVersion = 0;
+let autoRevealSuppressed = false;
+
+export function setAutoRevealSuppressed(suppressed) {
+  autoRevealSuppressed = !!suppressed;
+}
 
 function setExpandBusy(busy) {
   const button = $('#btn-expand-tree');
@@ -18,16 +28,6 @@ function setExpandBusy(busy) {
   button.setAttribute('aria-busy', String(busy));
   button.setAttribute('aria-label', busy ? 'Expanding project folders' : 'Expand all project folders');
   button.title = busy ? 'Expanding project folders (Collapse all to stop)' : 'Expand all project folders (ignored folders stay closed)';
-}
-
-let saveDirsTimer = null;
-function persistOpenDirs() {
-  if (saveDirsTimer) clearTimeout(saveDirsTimer);
-  saveDirsTimer = setTimeout(async () => {
-    try {
-      await apiPostJson('/api/session', { openDirs: Array.from(openDirs) });
-    } catch {}
-  }, 300);
 }
 
 /* git status letter -> CSS class + label. Empty/absent = clean, no badge. */
@@ -57,15 +57,58 @@ export async function drawTree(dir, container, depth, isCurrent) {
     const g = GIT_STATUS[c.status];
     const gc = g ? ' dirty ' + g[0] : '';
     const isYou = !!c.yourStatus;
-    const yc = isYou ? ' your-change' : '';
+    const yc = (isYou ? ' your-change' : '') + (prFileMap()?.[c.path] ? ' pr-file' : '');
     const youBadge = isYou ? '<span class="gs-you-tag" title="Modified by you in this review session">YOU</span>' : '';
     const badge = g ? '<span class="gs' + (isYou ? ' gs-you' : '') + '" title="' + (isYou ? 'Your change (' + c.yourStatus + '), git: ' + g[1] : 'git: ' + g[1]) + '">' + esc(c.status) + '</span>' + youBadge : '';
     const showTick = S.meta?.pr ? isYou : !!g;
-    const tick = showTick ? '<button class="stage-tick' + (c.staged ? ' staged' : '') + '" data-stage="' + esc(c.path) + '" title="' + (c.staged ? 'Unstage' : 'Stage') + '"></button>' : '';
-    return '<div class="tr file' + ig + gc + yc + '" data-file="' + esc(c.path) + '" style="padding-left:' + (pad + 12) + 'px" title="Open ' + esc(c.path) + note + '">' +
+    const isStaged = !!(showTick && c.staged);
+    const isPartial = isStaged && !!c.partial;
+    const sc = (isStaged ? ' is-staged' : '') + (isFileViewed(c.path) ? ' file-viewed' : '');
+    const tick = showTick ? '<button type="button" class="stage-tick' + (isStaged ? ' staged' : '') + (isPartial ? ' partial' : '') + '" data-stage="' + esc(c.path) + '" aria-pressed="' + (isStaged ? 'true' : 'false') + '" title="' + stageTickTitle(isStaged, isPartial) + '"></button>' : '';
+    return '<div class="tr file' + ig + gc + yc + sc + '" data-file="' + esc(c.path) + '"' + (c.status ? ' data-st="' + esc(c.status) + '"' : '') + (c.yourStatus ? ' data-yst="' + esc(c.yourStatus) + '"' : '') + ' style="padding-left:' + (pad + 12) + 'px" title="Open ' + esc(c.path) + note + '">' +
       '<span class="ic" data-t="' + fileKind(c.name) + '"></span><span class="nm">' + esc(c.name) + '</span>' + badge + tick + menuBtn + '</div>';
   }).join('');
+  relabelTreeBadges();
   return true;
+}
+
+/* A partial tick is staged but changed again since: clicking it stages the new
+   changes rather than unstaging, so the usual one click brings it up to date. */
+function stageTickTitle(staged, partial) {
+  if (partial) return 'Changed after staging: the staged copy is older than the file on disk, so a commit would leave the new edits out. Click to stage them.';
+  return staged ? 'Staged — click to unstage' : 'Stage file';
+}
+
+/* The paths the PR itself changes (server: diffBase..PR head), as a Set. Rows in
+   the sidebar's "PR changes" scope are limited to these; a file only you have
+   touched belongs to "Yours". Null outside PR review. */
+const prFileMap = () => S.meta?.pr?.files || null;
+
+/* The badge letter follows the sidebar scope. "PR changes" keeps the letter the
+   PR itself gave the file (A, M, D...) however you have edited it since; "Yours"
+   shows your change measured from the PR head; otherwise git's combined status.
+   Rows remember both letters (data-st / data-yst) so a scope switch can relabel
+   them without another fetch. */
+function scopedCode(path, st, yst) {
+  if (treeEl.classList.contains('scope-pr')) return prFileMap()?.[path] || st;
+  if (treeEl.classList.contains('scope-yours')) return yst || st;
+  return st;
+}
+
+export function relabelTreeBadges() {
+  for (const row of treeEl.querySelectorAll('.tr.file[data-st]')) {
+    const badge = row.querySelector('.gs');
+    if (!badge) continue;
+    const code = scopedCode(row.dataset.file, row.dataset.st, row.dataset.yst);
+    const g = GIT_STATUS[code];
+    if (!g) continue;
+    row.classList.remove('git-M', 'git-A', 'git-D', 'git-untracked', 'git-R');
+    row.classList.add(g[0]);
+    badge.textContent = code;
+    const you = !!row.dataset.yst;
+    badge.title = you && !treeEl.classList.contains('scope-pr')
+      ? 'Your change (' + row.dataset.yst + '), git: ' + g[1] : 'git: ' + g[1];
+  }
 }
 
 /* A colour family per file kind, drawn in CSS. Emoji or icon fonts would be at
@@ -93,37 +136,36 @@ export async function refreshTree() {
   const isCurrent = () => version === expansionVersion;
   setExpandBusy(false);
   if (!(await drawTree('', treeEl, 0, isCurrent))) return;
-  const dirs = Array.from(openDirs).sort((a, b) => a.split('/').length - b.split('/').length);
-  for (const path of dirs) {
+  const byDepth = new Map();
+  for (const path of openDirs) {
+    const depth = path.split('/').length;
+    if (!byDepth.has(depth)) byDepth.set(depth, []);
+    byDepth.get(depth).push(path);
+  }
+  const depths = Array.from(byDepth.keys()).sort((a, b) => a - b);
+  for (const depth of depths) {
     if (!isCurrent()) return;
-    const dirRow = treeEl.querySelector('[data-dir="' + CSS.escape(path) + '"]');
-    const kids = treeEl.querySelector('[data-kids="' + CSS.escape(path) + '"]');
-    if (kids && dirRow) {
-      dirRow.classList.add('open');
-      kids.classList.add('open');
-      const loaded = await drawTree(path, kids, path.split('/').length, isCurrent);
+    await Promise.all(byDepth.get(depth).map(async path => {
       if (!isCurrent()) return;
-      if (loaded) kids.dataset.loaded = '1';
-      else {
-        dirRow.classList.remove('open');
-        kids.classList.remove('open');
+      const dirRow = treeEl.querySelector('[data-dir="' + CSS.escape(path) + '"]');
+      const kids = treeEl.querySelector('[data-kids="' + CSS.escape(path) + '"]');
+      if (kids && dirRow) {
+        dirRow.classList.add('open');
+        kids.classList.add('open');
+        const loaded = await drawTree(path, kids, depth, isCurrent);
+        if (!isCurrent()) return;
+        if (loaded) kids.dataset.loaded = '1';
+        else {
+          dirRow.classList.remove('open');
+          kids.classList.remove('open');
+          openDirs.delete(path);
+        }
+      } else {
         openDirs.delete(path);
       }
-    } else {
-      openDirs.delete(path);
-    }
+    }));
   }
-  if (isCurrent() && treeEl.classList.contains('changed-only')) {
-    await expandDirtyDirs();
-  }
-}
-
-export function restoreOpenDirs(dirs) {
-  if (Array.isArray(dirs)) {
-    for (const d of dirs) {
-      if (typeof d === 'string') openDirs.add(d);
-    }
-  }
+  markTreeCleanState();
 }
 
 export function collapseAllDirs() {
@@ -139,11 +181,14 @@ export function collapseAllDirs() {
   });
 
   setExpandBusy(false);
-  persistOpenDirs();
 }
 
 export async function expandAllDirs() {
-  if (treeEl.classList.contains('changed-only') || $('#btn-expand-tree')?.classList.contains('busy')) return;
+  if ($('#btn-expand-tree')?.classList.contains('busy')) return;
+  if (treeEl.classList.contains('changed-only')) {
+    await expandDirtyDirs();
+    return;
+  }
   const version = ++expansionVersion;
   setExpandBusy(true);
   const queue = Array.from(treeEl.querySelectorAll('.tr.dir'), row => row.dataset.dir);
@@ -184,7 +229,6 @@ export async function expandAllDirs() {
     }
   } finally {
     if (version === expansionVersion) {
-      persistOpenDirs();
       setExpandBusy(false);
       if (failed) showToast('!', failed + (failed === 1 ? ' folder could not be loaded' : ' folders could not be loaded'));
     }
@@ -223,10 +267,11 @@ export async function revealDir(dir) {
   if (!isCurrent()) return;
   const last = treeEl.querySelector('[data-dir="' + CSS.escape(dir) + '"]');
   if (last) last.scrollIntoView({ block: 'center' });
-  persistOpenDirs();
 }
 
 export async function revealFile(path) {
+  if (!path) return;
+  path = path.replace(/^\/+/, '');
   const idx = path.lastIndexOf('/');
   if (idx > 0) await revealDir(path.slice(0, idx));
   const row = treeEl.querySelector('[data-file="' + CSS.escape(path) + '"]');
@@ -237,34 +282,73 @@ export async function revealFile(path) {
   }
 }
 
-export async function expandDirtyDirs(container = treeEl, version = expansionVersion) {
+export async function expandDirtyDirs(container = treeEl, version = expansionVersion, seen = new Set()) {
   const isCurrent = () => version === expansionVersion && treeEl.classList.contains('changed-only');
   if (!isCurrent()) return;
-  const dirtyRows = Array.from(container.querySelectorAll('.tr.dir.dirty:not(.open)'));
-  for (const dirRow of dirtyRows) {
+  const dirtyRows = Array.from(container.querySelectorAll('.tr.dir.dirty'));
+  await Promise.all(dirtyRows.map(async dirRow => {
     if (!isCurrent()) return;
     const path = dirRow.dataset.dir;
-    const kids = container.querySelector('[data-kids="' + CSS.escape(path) + '"]');
-    if (kids) {
-      dirRow.classList.add('open');
-      kids.classList.add('open');
-      openDirs.add(path);
+    if (!path || seen.has(path)) return;
+    seen.add(path);
+    const kids = treeEl.querySelector('[data-kids="' + CSS.escape(path) + '"]');
+    if (!kids) return;
+
+    dirRow.classList.add('open');
+    kids.classList.add('open');
+    openDirs.add(path);
+
+    if (!kids.dataset.loaded) {
       const loaded = await drawTree(path, kids, path.split('/').length, isCurrent);
       if (!isCurrent()) return;
       if (loaded) {
         kids.dataset.loaded = '1';
-        await expandDirtyDirs(kids, version);
       } else {
         dirRow.classList.remove('open');
         kids.classList.remove('open');
         openDirs.delete(path);
+        return;
+      }
+    }
+
+    await expandDirtyDirs(kids, version, seen);
+  }));
+}
+
+export async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}, staged = {}, yourStatuses = {}, yourDirtyDirs = {}, partial = {}) {
+  // Check if any changed files belong to an open directory (or root) but don't have a DOM element yet,
+  // or if any previously deleted files are now clean (so they should disappear from the tree).
+  let needRefresh = false;
+  for (const [p, code] of Object.entries(statuses)) {
+    const fileRow = treeEl.querySelector('[data-file="' + CSS.escape(p) + '"]');
+    if (!fileRow) {
+      const lastSlash = p.lastIndexOf('/');
+      const parentDir = lastSlash >= 0 ? p.slice(0, lastSlash) : '';
+      if (parentDir === '' || openDirs.has(parentDir)) {
+        needRefresh = true;
+        break;
       }
     }
   }
-  if (isCurrent()) persistOpenDirs();
-}
 
-export async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}, staged = {}, yourStatuses = {}, yourDirtyDirs = {}) {
+  if (!needRefresh) {
+    const dirtyFiles = treeEl.querySelectorAll('.tr.file.dirty');
+    for (const fileRow of dirtyFiles) {
+      const p = fileRow.dataset.file;
+      if (!statuses[p] && fileRow.classList.contains('git-D')) {
+        needRefresh = true;
+        break;
+      }
+    }
+  }
+
+  if (needRefresh) {
+    await refreshTree();
+    if (inGitMode()) await expandDirtyDirs();
+    markTreeCleanState();
+    return;
+  }
+
   // 1. Update folder dirty and your-dirty classes
   const dirRows = treeEl.querySelectorAll('.tr.dir');
   for (const dirRow of dirRows) {
@@ -278,7 +362,7 @@ export async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}, staged =
   for (const fileRow of dirtyFiles) {
     const p = fileRow.dataset.file;
     if (!statuses[p]) {
-      fileRow.classList.remove('dirty', 'git-M', 'git-A', 'git-D', 'git-untracked', 'git-R', 'your-change');
+      fileRow.classList.remove('dirty', 'is-staged', 'git-M', 'git-A', 'git-D', 'git-untracked', 'git-R', 'your-change');
       const badge = fileRow.querySelector('.gs');
       if (badge) badge.remove();
       const youTag = fileRow.querySelector('.gs-you-tag');
@@ -296,6 +380,8 @@ export async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}, staged =
     const isYou = !!yourStatuses[p];
     fileRow.classList.remove('git-M', 'git-A', 'git-D', 'git-untracked', 'git-R');
     fileRow.classList.toggle('your-change', isYou);
+    if (code) fileRow.dataset.st = code; else delete fileRow.dataset.st;
+    if (yourStatuses[p]) fileRow.dataset.yst = yourStatuses[p]; else delete fileRow.dataset.yst;
     if (g) {
       fileRow.classList.add('dirty', g[0]);
       let badge = fileRow.querySelector('.gs');
@@ -322,21 +408,27 @@ export async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}, staged =
       }
 
       const showTick = S.meta?.pr ? isYou : true;
+      const isStaged = !!(showTick && staged[p]);
+      const isPartial = isStaged && !!partial[p];
+      fileRow.classList.toggle('is-staged', isStaged);
       let tick = fileRow.querySelector('.stage-tick');
       if (showTick) {
         if (!tick) {
           tick = document.createElement('button');
+          tick.type = 'button';
           tick.className = 'stage-tick';
           tick.dataset.stage = p;
           fileRow.appendChild(tick);
         }
-        tick.classList.toggle('staged', !!staged[p]);
-        tick.title = staged[p] ? 'Unstage' : 'Stage';
+        tick.classList.toggle('staged', isStaged);
+        tick.classList.toggle('partial', isPartial);
+        tick.setAttribute('aria-pressed', isStaged ? 'true' : 'false');
+        tick.title = stageTickTitle(isStaged, isPartial);
       } else if (tick) {
         tick.remove();
       }
     } else {
-      fileRow.classList.remove('dirty', 'your-change');
+      fileRow.classList.remove('dirty', 'is-staged', 'your-change');
       const badge = fileRow.querySelector('.gs');
       if (badge) badge.remove();
       const youTag = fileRow.querySelector('.gs-you-tag');
@@ -362,45 +454,65 @@ export async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}, staged =
     }
   }
 
-  // If in changed-only mode, auto-expand any newly dirty directories
-  if (treeEl.classList.contains('changed-only')) {
-    await expandDirtyDirs();
-  }
+  relabelTreeBadges();
+  markTreeCleanState();
+}
+
+/* Whether the Git view has anything to show. Unpushed commits count: once you
+   commit, the working tree goes clean but the commits are still unreviewed, and
+   the Unpushed section under the tree (unpushed.js, which owns S.unpushedCount)
+   is exactly where they show up. */
+/* In Git view with a clean working tree the tree renders nothing (every row is
+   filtered out), so it stops claiming the sidebar's spare height and says why.
+   The Unpushed section below it is then the whole of the view. */
+export function markTreeCleanState() {
+  const hasDirtyRows = !!treeEl?.querySelector('.tr.file.dirty');
+  const hasChanges = (S.meta?.gitChanges > 0) || hasDirtyRows;
+  treeEl?.classList.toggle('no-changes',
+    treeEl?.classList.contains('changed-only') && !hasChanges);
+}
+
+export function hasGitView() {
+  return !!(S.meta?.git && ((S.meta.gitChanges > 0) || (S.unpushedCount > 0) || S.meta?.pr));
+}
+
+export function inGitMode() {
+  return !!treeEl?.classList.contains('changed-only');
 }
 
 export function updateSidebarToggleState() {
   const btnChanged = $('#btn-changed');
-  const hasGitChanges = !!(S.meta?.git && S.meta.gitChanges > 0);
-  if (btnChanged) {
-    btnChanged.disabled = !hasGitChanges;
-    btnChanged.classList.toggle('disabled', !hasGitChanges);
-    if (!S.meta?.git) {
-      btnChanged.title = 'Git not available in workspace';
-    } else if (!hasGitChanges) {
-      btnChanged.title = 'There are no git modified files.';
-    } else {
-      btnChanged.title = 'Git changes (show changed files only)';
-    }
+  if (!btnChanged) return;
+  const available = hasGitView();
+  btnChanged.disabled = !available;
+  btnChanged.classList.toggle('disabled', !available);
+  if (!S.meta?.git) {
+    btnChanged.title = 'Git not available in workspace';
+  } else if (!available) {
+    btnChanged.title = 'There are no git modified files.';
+  } else if (!(S.meta.gitChanges > 0)) {
+    btnChanged.title = 'Git changes (working tree clean — showing unpushed commits)';
+  } else {
+    btnChanged.title = 'Git changes (show changed files only)';
   }
 }
 
-export async function setSidebarMode(mode) {
+export async function setSidebarMode(mode, { expandDirty = true } = {}) {
   const btnChanged = $('#btn-changed');
   const btnFiles = $('#btn-files');
   const btnCollapse = $('#btn-collapse-tree');
   const btnExpand = $('#btn-expand-tree');
   updateSidebarToggleState();
-  const hasGitChanges = !!(S.meta?.git && S.meta.gitChanges > 0);
 
-  if (mode === 'git' && hasGitChanges) {
+  if (mode === 'git' && hasGitView()) {
     treeEl.classList.add('changed-only');
     btnChanged?.classList.add('active');
     btnFiles?.classList.remove('active');
-    if (btnCollapse) btnCollapse.hidden = true;
-    if (btnExpand) btnExpand.hidden = true;
+    if (btnCollapse) btnCollapse.hidden = false;
+    if (btnExpand) btnExpand.hidden = false;
     expansionVersion++;
     setExpandBusy(false);
-    await expandDirtyDirs();
+    if (expandDirty) await expandDirtyDirs();
   } else {
     treeEl.classList.remove('changed-only');
     btnFiles?.classList.add('active');
@@ -408,6 +520,9 @@ export async function setSidebarMode(mode) {
     if (btnCollapse) btnCollapse.hidden = false;
     if (btnExpand) btnExpand.hidden = false;
   }
+  markTreeCleanState();
+  // unpushed.js hangs its section off this; tree.js doesn't import it.
+  emit('sidebar:mode', { mode: treeEl.classList.contains('changed-only') ? 'git' : 'files' });
 }
 
 export function closeTreeMenu() {
@@ -428,11 +543,18 @@ export function openTreeMenu(row, x, y) {
   if (!treeMenu) return;
   treeMenu.replaceChildren();
 
-  const items = [
+  const items = [];
+  if (isDir) {
+    items.push(
+      { action: 'new-file', label: 'New File...' },
+      { action: 'new-folder', label: 'New Folder...' },
+    );
+  }
+  items.push(
     { action: 'copy-relative', label: 'Copy Relative Path' },
     { action: 'copy-name', label: isDir ? 'Copy Folder Name' : 'Copy File Name' },
     { action: 'copy-absolute', label: 'Copy Absolute Path' },
-  ];
+  );
 
   for (const item of items) {
     const btn = document.createElement('button');
@@ -463,7 +585,11 @@ export function initTree() {
       const act = btn.dataset.action;
       closeTreeMenu();
 
-      if (act === 'copy-relative') {
+      if (act === 'new-file') {
+        promptNewItem('file', path);
+      } else if (act === 'new-folder') {
+        promptNewItem('dir', path);
+      } else if (act === 'copy-relative') {
         copyToClipboard(path, 'Copied ' + path);
       } else if (act === 'copy-name') {
         copyToClipboard(name, 'Copied ' + name);
@@ -484,7 +610,6 @@ export function initTree() {
   }
 
   $('#btn-collapse-tree')?.addEventListener('click', () => {
-    if (treeEl.classList.contains('changed-only')) return;
     collapseAllDirs();
   });
 
@@ -493,9 +618,8 @@ export function initTree() {
   });
 
   $('#btn-changed')?.addEventListener('click', async () => {
-    const hasGitChanges = !!(S.meta?.git && S.meta.gitChanges > 0);
-    if (!hasGitChanges) return;
-    await setSidebarMode('git');
+    if (!hasGitView()) return;
+    await setSidebarMode('git', { expandDirty: true });
   });
 
   $('#btn-files')?.addEventListener('click', async () => {
@@ -525,15 +649,31 @@ export function initTree() {
     const tick = e.target.closest('.stage-tick');
     if (tick) {
       e.stopPropagation();
+      e.preventDefault();
       const path = tick.dataset.stage;
-      const staged = tick.classList.toggle('staged'); // optimistic; the git-status stream reconciles it
-      tick.title = staged ? 'Unstage' : 'Stage';
+      const wasPartial = tick.classList.contains('partial');
+      const staged = wasPartial || !tick.classList.contains('staged');
+      const applyOptimistic = s => {
+        for (const el of $$('.stage-tick[data-stage="' + CSS.escape(path) + '"]')) {
+          const partial = s !== staged && wasPartial; // only a rollback restores it
+          el.classList.toggle('staged', s);
+          el.classList.toggle('partial', partial);
+          el.setAttribute('aria-pressed', s ? 'true' : 'false');
+          el.title = stageTickTitle(s, partial);
+          el.closest('.tr.file')?.classList.toggle('is-staged', s);
+        }
+      };
+      applyOptimistic(staged);
       try {
-        await apiPostJson(staged ? '/api/git/stage' : '/api/git/unstage', { path });
+        const res = await apiPostJson(staged ? '/api/git/stage' : '/api/git/unstage', { path });
+        if (res && res.git !== undefined) {
+          await handleGitStatus(res);
+        } else {
+          await triggerRefresh();
+        }
       } catch (err) {
-        tick.classList.toggle('staged', !staged);
-        tick.title = staged ? 'Stage' : 'Unstage';
-        showToast('!', err.message || 'Could not update staging');
+        applyOptimistic(!staged);
+        emit('git:error', { title: staged ? 'Could not stage' : 'Could not unstage', message: err.message || '' });
       }
       return;
     }
@@ -558,14 +698,25 @@ export function initTree() {
           }
         }
       } else openDirs.delete(path);
-      persistOpenDirs();
       return;
     }
     const f = e.target.closest('[data-file]');
     if (f) {
       $$('.tr.sel', treeEl).forEach(x => x.classList.remove('sel'));
       f.classList.add('sel');
-      openFile(f.dataset.file);
+      // The scope picks the section: "Yours" opens Your changes with the PR's
+      // folded, "PR changes" the reverse -- also for a tab that is already open
+      // and has been toggled the other way.
+      const t = S.tabs.find(x => x.path === f.dataset.file);
+      if (t) focusDiffScope(t);
+      openFile(f.dataset.file).then(() => { if (t) syncDiffView(); });
     }
+  });
+
+  on('tab:activated', ({ doc }) => {
+    if (autoRevealSuppressed) return;
+    if (!doc || !doc.path || !isAutoRevealEnabled()) return;
+    if (document.body.classList.contains('side-hidden')) return;
+    revealFile(doc.path);
   });
 }

@@ -6,13 +6,13 @@ This document describes the high-level architecture, startup pipeline, HTTP serv
 
 px0 is engineered as an ultra-fast, zero-overhead code exploration console. Its architecture is guided by five foundational tenets:
 
-1. Edits Are Delegated: px0 navigates, searches, and inspects code, and does not author changes itself. There are no save buttons and no endpoint accepts file content. Changes are made by a coding harness px0 dispatches on request, one per non-overlapping line range so several can run at once (see [Harness Editing & Agent Dispatch](agent-editing.md)).
+1. Edits Are Mostly Delegated: px0 navigates, searches, and inspects code. Large or multi-file changes are made by a coding harness px0 dispatches on request, one per non-overlapping line range so several can run at once (see [Harness Editing & Agent Dispatch](agent-editing.md)). Small direct edits and new files are the one exception: `/api/file/save` and `/api/fs/new` write content typed in the browser (see [File Editing](file-editing.md)).
 1. Single Static Binary Footprint: All frontend assets (HTML, CSS, JavaScript, icons, themes) are embedded directly into the Go binary at compile time via `go:embed`. px0 requires no Node.js, Python, or Ruby runtime, no external database, and no CGO dependencies.
 1. Sub-Millisecond Responsiveness: The HTTP listener binds, serves the web UI, and opens the default browser in under 1 millisecond. Heavy operations (full directory indexing, git status checks, language server binary discovery) run asynchronously off the critical path.
-1. Stateless in the Workspace: px0 never writes configuration directories, temporary caches, or metadata files (e.g., `.px0/` or `.cache/`) into a workspace. Indexes and caches live in volatile memory. Outside the workspace it keeps only the remembered harness choice and update/telemetry state under `~/.px0/` (or `$XDG_CONFIG_HOME/px0/`).
+1. Stateless in the Workspace: px0 never writes configuration directories, temporary caches, or metadata files (e.g., `.px0/` or `.cache/`) into a workspace. Indexes and caches live in volatile memory. Outside the workspace it keeps the remembered harness choice and update/telemetry state under `~/.px0/` (or `$XDG_CONFIG_HOME/px0/`), and per-workspace session files (PR review drafts) and the workbench store under `~/.px0/` (or `$XDG_STATE_HOME/px0/`).
 1. Strict Memory Reclamation: Long-lived background processes should not hold idle RAM. When the user finishes a burst of queries, unused pages are proactively returned to the operating system.
 
-The browser's file tabs are managed in `web/src/tabs.js`. Tab context-menu actions and the tab close button share cache cleanup. A bulk close updates the browser view and session once after removing the selected tabs.
+The browser's file tabs are managed in `web/src/tabs.js`. Tab context-menu actions and the tab close button share cache cleanup. A bulk close updates the browser view once after removing the selected tabs. Open tabs are not saved: a reload starts with no tabs open.
 
 ## 2. Startup Pipeline (<1 ms Critical Path)
 
@@ -23,6 +23,7 @@ sequenceDiagram
     autonumber
     participant CLI as main() CLI Entrypoint
     participant Net as TCP Listener
+    participant OS as Network Interfaces
     participant Browser as Host Browser
     participant Srv as HTTP Server Router
     participant Index as Background Indexer
@@ -31,6 +32,11 @@ sequenceDiagram
     CLI->>Net: listen(host, port)
     Note over CLI,Net: Binds socket in <0.2ms
     CLI->>Srv: NewServer(Index, LSP)
+    opt host is 0.0.0.0
+        CLI->>OS: InterfaceAddrs()
+        OS-->>CLI: Interface addresses
+        CLI->>CLI: Print sorted non-loopback IPv4 URLs
+    end
     CLI->>Browser: go openBrowser(url) [Non-blocking]
     CLI->>Index: go ix.Build() [Background Goroutine]
     CLI->>LSP: go lsp.Available() [Background Goroutine]
@@ -45,6 +51,7 @@ sequenceDiagram
 
 1. Target Resolution: Directories become workspace roots. For a file target, its repository or project root is detected as the workspace, and its relative path (with optional line number) is retained for the initial browser tab.
 1. Socket Binding: `listen(*host, *port)` binds an ephemeral or user-specified TCP socket immediately.
+1. Network URL Discovery: When the listener binds to `0.0.0.0`, `net.InterfaceAddrs()` supplies the host's interface addresses. px0 keeps unique non-loopback IPv4 addresses, sorts them for deterministic output, and prints each with the listener's final port. Initial file and line query parameters are preserved in every advertised URL.
 1. Instant Root Tree Extraction: Before descending into subdirectories, `ix.Build()` extracts and populates the root directory entries (`dir=""`), publishing them directly to `ix.children[""]`. When the browser makes its initial request to `/api/tree`, it immediately renders the root tree nodes without waiting for the deep repository scan to finish.
 
 1. Non-Blocking Browser Launch: `go openBrowser(url)` spawns the platform-specific browser opener (`xdg-open` on Linux, `open` on macOS, `rundll32` on Windows) in a separate goroutine.
@@ -63,43 +70,105 @@ When hosted behind reverse proxies or multi-tenant review platforms, px0 support
 - `handleIndex` dynamically injects `<base href="/<base-path>/">` into `web/index.html`, allowing the frontend to resolve relative assets and API endpoints without domain-level assumptions.
 - Requests to `/<base-path>` without a trailing slash redirect to `/<base-path>/`, and root `/` redirects to the configured base path.
 
+### Subsystem Structure & Package Architecture
+
+px0 is structured into decoupled core files and modular `internal/` packages:
+
+- **Root Package (`px0`)**: Contains the CLI entrypoint ([`main.go`](../../main.go)), HTTP routing and middleware ([`server.go`](../../server.go)), filesystem indexing and tree walk ([`index.go`](../../index.go)), search pipeline ([`search.go`](../../search.go)), Git operations and watcher ([`git.go`](../../git.go)), LSP client and supervisor ([`lsp.go`](../../lsp.go)), agent harnesses and multi-turn threads ([`agent.go`](../../agent.go)), PR review lifecycle ([`pr.go`](../../pr.go)), forge providers ([`forge.go`](../../forge.go)), and multi-repo workbench ([`workbench.go`](../../workbench.go)).
+- **`internal/fuzzy`**: Two-pass bounded fuzzy path finder and score ranking.
+- **`internal/ignore`**: Gitignore rule parsing and fast path glob matching.
+- **`internal/render`**: Windowed Chroma syntax highlighting, markdown rendering, and diff coloring.
+- **`internal/symbols`**: Regex-based multi-language declaration and symbol extraction.
+- **`internal/table`**: Delimiter sniffing and CSV/TSV table parsing.
+- **`internal/settings`**: Configuration schema, JSON persistence, and settings synchronization.
+- **`internal/telemetry`**: Anonymous event dispatch and usage telemetry.
+- **`internal/ui`**: Terminal formatting, ANSI colors, spinner animations, and TTY handling.
+- **`internal/metrics`**: Process memory, CPU, and goroutine monitoring.
+- **`internal/update`**: Self-update manifest checking, checksum verification, and binary replacement.
+
 ### Endpoints Reference
 
 | Endpoint              | Method | Purpose                                                                 | Response Format                            |
 | --------------------- | ------ | ----------------------------------------------------------------------- | ------------------------------------------ |
-| `/`                   | `GET`  | Serves `web/index.html` (embedded or `-dev` disk copy)                  | `text/html; charset=utf-8`                 |
+| `/`                   | `GET`  | Serves `web/index.html` (embedded)                                      | `text/html; charset=utf-8`                 |
 | `/static/*`           | `GET`  | Serves bundled JavaScript, CSS, and static assets                       | Asset MIME type                            |
 | `/static/themes.css`  | `GET`  | Concatenates all `web/themes/*.css` files in alphanumeric order         | `text/css; charset=utf-8`                  |
 | `/api/meta`           | `GET`  | Workspace metadata (root path, file count, index duration, git status)  | JSON (`{root, name, files, build_ms, git}`)|
 | `/api/metrics`        | `GET`  | Point-in-time process memory, CPU, and goroutine stats (polled via `/api/stream` SSE) | JSON (`{rssBytes, cpuUsage, goroutines}`)|
 | `/api/tree`           | `GET`  | Directory contents for the sidebar file explorer (`?dir=path`)          | JSON array of `Node` objects               |
 | `/api/file`           | `GET`  | Windowed, highlighted source file lines (`?path=...&start=0&count=500`) | JSON (`{lines, total, refine, markdown}`)  |
-| `/api/raw`            | `GET`  | Raw, unhighlighted file content for whole-file copies and preview assets| `text/plain` or binary                     |
+| `/api/file/save`      | `POST` | Write edited file content, creating parent folders                      | JSON (`{ok, path, size}`)                  |
+| `/api/fs/new`         | `POST` | Create an empty file or a folder (`409` if it exists)                   | JSON (`{ok, path, type}`)                  |
+| `/api/close`          | `POST` | Release cached document handles and LSP files when tab closes          | JSON (`{ok: true}`)                        |
+| `/api/raw`            | `GET`  | Raw file content for copies and preview assets (attachment; nosniff)    | `application/octet-stream` or `image/*`    |
+| `/api/htmlpreview/<path>` | `GET` | Workspace page or same-origin asset for the HTML preview iframe, under a no-script sandbox CSP | `text/html`, `text/css`, `image/*`, `font/*` |
 | `/api/markdown`       | `GET`  | Converted HTML preview of `.md` / `.markdown` files via goldmark        | JSON (`{path, html}`)                      |
-| `/api/find`           | `GET`  | Fast fuzzy match against all indexed workspace paths (`?q=...`)         | JSON array of `FuzzyResult` objects        |
-| `/api/resolve`        | `GET`  | Resolves relative/import paths to workspace files (`?from=...&target=...`)| JSON (`{found, path, line}`)               |
+| `/api/table`          | `GET`  | First 1,000 rows (or 1 MB) of a `.csv` / `.tsv` file, parsed with `encoding/csv` | JSON (`{header, headerLine, rows, cols, truncated}`) |
+| `/api/find`           | `GET`  | Fast fuzzy match against all indexed workspace paths (`?q=...`)         | JSON (`{results: [...], indexing: bool}`)  |
+| `/api/resolve`        | `GET`  | Resolves relative/import paths to workspace files (`?from=...&target=...`) | JSON (`{found, path, line}`) |
 | `/api/search`         | `GET`  | Full-text project grep with snippet elision (`?q=...&case=...&regex=...`)| JSON array of file hits and matches        |
 | `/api/outline`        | `GET`  | Regex-extracted symbol outline for a given file (`?path=...`)          | JSON array of symbol declarations          |
 | `/api/def`            | `GET`  | Quick definition lookup fallback                                        | JSON array of matching definition locations|
-| `/api/diff`           | `GET`  | Unified diff of working tree vs. `HEAD` (`?path=...`)                   | JSON (`{path, diff, available}`)           |
+| `/api/diff`           | `GET`  | Unified diff of working tree vs. `HEAD` or commit ref (`?path=...&ref=...`) | JSON (`{path, diff, available}`)      |
 | `/api/gutter`         | `GET`  | Per-line change markers for code view gutter                            | JSON (`{added, modified, deleted}`)        |
-| `/api/stream`         | `GET`  | Unified SSE stream for real-time `git-status` and `metrics` events (aliased by `/api/git/stream`) | `text/event-stream`   |
+| `/api/stream`         | `GET`  | Unified SSE stream for real-time `git-status` and `metrics` events (aliased by `/api/git/stream`); `?threads=1`, `?thread=<id>` and `?review=1` add thread and review workflow events, so each tab holds one connection | `text/event-stream`   |
 | `/api/git/refresh`    | `POST` | Triggers immediate git status check and returns status payload          | JSON (`{git, gitChanges, gitFiles, ...}`)  |
-| `/api/reindex`        | `POST` | Re-runs index walk and git status on demand (triggers frontend tab reload; see [`file-reload-and-updates.md`](file-reload-and-updates.md)) | JSON (`{files, indexMs}`)                  |
+| `/api/git/stage`      | `POST` | Stage a file (`?path=...`), or `"."` for all changes                   | JSON (`{ok, status}`)                      |
+| `/api/git/unstage`    | `POST` | Unstage a file (`?path=...`)                                            | JSON (`{ok, status}`)                      |
+| `/api/git/hunk`       | `POST` | Stage, unstage, or discard an isolated diff hunk (`?path=...&action=...`) | JSON (`{ok: true}`)                     |
+| `/api/git/commit`     | `POST` | Commit staged changes (auto-stages unstaged modifications if none staged) | JSON (`{ok, sha}`)                      |
+| `/api/git/commit-message` | `POST` | Dispatch harness to write commit message from staged diff           | JSON job snapshot                          |
+| `/api/git/push`       | `POST` | Push current branch (or PR head) to remote                              | JSON (`{ok: true}`)                        |
+| `/api/git/pull`       | `POST` | Fast-forward pull from upstream                                         | JSON (`{ok: true}`)                        |
+| `/api/git/sync-agent` | `POST` | Dispatch harness to rebase or merge diverged branches                   | JSON job snapshot                          |
+| `/api/git/sync-state` | `GET`  | Current branch divergence and in-progress rebase/merge state            | JSON (`{code, branch, upstream, ...}`)     |
+| `/api/git/abort`      | `POST` | Abort a rebase or merge in progress                                     | JSON (`{ok: true}`)                        |
+| `/api/git/log`        | `GET`  | Recent commits in active repository                                     | JSON array of recent commits               |
+| `/api/unpushed`       | `GET`  | List commits on local branch not yet pushed to upstream                 | JSON (`{available, upstream, commits}`)    |
+| `/api/commitfiles`    | `GET`  | Files touched by a specific commit (`?sha=...`)                         | JSON array of file records                 |
+| `/api/commitdetail`   | `GET`  | Commit author, message, and diffstat summary (`?sha=...`)               | JSON commit details                        |
+| `/api/reindex`        | `POST` | Re-runs index walk and git status on demand                             | JSON (`{files, indexMs}`)                  |
 | `/api/lsp/def`        | `GET`  | Go-to-Definition via LSP (`?path=...&line=...&col=...`)                 | JSON array of target locations             |
 | `/api/lsp/refs`       | `GET`  | Find References via LSP                                                 | JSON array of reference locations          |
 | `/api/lsp/calls`      | `POST` | Incoming/outgoing call hierarchy tree expansion                         | JSON array of `CallNode` objects           |
 | `/api/lsp/symbols`    | `GET`  | Document symbols extracted via LSP                                      | JSON array of LSP symbols                  |
 | `/api/lsp/hover`      | `GET`  | Type signature and markdown doc hovercard info                          | JSON (`{contents: ...}`)                   |
+| `/api/lsp/diagnostics`| `GET`  | Diagnostics published for file (`?path=...`)                            | JSON array of `LSPDiagnostic` objects      |
 | `/api/lsp/warm`       | `POST` | Pre-warms or spawns language server for given file extension            | JSON (`{ok: true}`)                        |
 | `/api/lsp/setup`      | `GET`  | Reports install status and commands for current file language           | JSON (`{installed, recipes, ...}`)         |
 | `/api/lsp/install`    | `POST` | Executes user-level installer in background                             | JSON (`{ok: true}`)                        |
-| `/api/lsp/start`      | `POST` | Rescans and starts language server after installation                   | JSON (`{ok: true}`)                        |
-| `/api/agent/harnesses`| `GET`  | Detected coding harnesses and the current choice                        | JSON (`{harnesses, selected, pinned, settings}`) |
-| `/api/agent/select`   | `POST` | Choose and remember a harness (`?name=...`)                             | JSON (`{harnesses, selected, pinned, settings}`) |
-| `/api/agent/edit`     | `POST` | Dispatch an instruction to the harness (`?path=...&l1=...&l2=...&instruction=...`) | JSON job snapshot               |
-| `/api/agent/job`      | `GET`  | Snapshot of job `?id=...`, or the most recently started when omitted: output, changed files | JSON job snapshot          |
-| `/api/agent/cancel`   | `POST` | Stop every running harness                                              | JSON (`{cancelled}`)                       |
+| `/api/lsp/start`      | `POST` | Starts language server for path or server name                          | JSON status payload                        |
+| `/api/lsp/stop`       | `POST` | Stops language server (`?server=...`) or all running servers            | JSON status payload                        |
+| `/api/lsp/servers`    | `GET`  | Lists relevant language servers for workspace with status and metrics   | JSON (`{enabled, anyRunning, servers}`)    |
+| `/api/agent/harnesses`| `GET`  | Detected coding harnesses and current choice                            | JSON (`{harnesses, selected, pinned, ...}`)|
+| `/api/agent/select`   | `POST` | Choose and remember a harness (`?name=...`)                             | JSON (`{harnesses, selected, pinned, ...}`)|
+| `/api/agent/edit`     | `POST` | Dispatch an instruction to the harness for a line range                 | JSON job snapshot                          |
+| `/api/agent/batch`    | `POST` | Dispatch a batch edit instruction across multiple ranges/files          | JSON job snapshot                          |
+| `/api/agent/job`      | `GET`  | Snapshot of job output and changed files                                | JSON job snapshot                          |
+| `/api/agent/cancel`   | `POST` | Stop running harness job                                                | JSON (`{cancelled: true}`)                 |
+| `/api/threads`        | `GET`  | List thread summaries for workspace                                     | JSON array of thread summaries             |
+| `/api/threads/get`    | `GET`  | Fetch thread details and turn history (`?id=...`)                       | JSON thread object                         |
+| `/api/threads/create` | `POST` | Create a new thread and run first turn                                  | JSON thread object                         |
+| `/api/threads/send`   | `POST` | Post follow-up message to an existing thread                            | JSON thread object                         |
+| `/api/threads/cancel` | `POST` | Cancel active turn on thread                                            | JSON (`{ok: true}`)                        |
+| `/api/threads/scope`  | `POST` | Update thread review scope in PR mode (`pr`, `mine`, `selection`)       | JSON (`{ok: true}`)                        |
+| `/api/threads/delete` | `POST` | Delete thread by ID                                                     | JSON (`{ok: true}`)                        |
+| `/api/threads/revert` | `POST` | Revert file changes made by a specific turn                             | JSON (`{ok, thread, reverted}`)            |
+| `/api/threads/stream` | `GET`  | SSE event feed for thread updates and turn outputs                      | `text/event-stream`                        |
+| `/api/settings`       | `GET` / `POST` | Read or update workspace/global configuration                   | JSON settings schema and values            |
+| `/api/pr/meta`        | `GET`  | PR metadata, merge-base, head SHA, and diffstat                         | JSON PR metadata                           |
+| `/api/pr/comments`    | `GET`  | Draft comments for active PR review session                             | JSON array of comments                     |
+| `/api/pr/comments/delete` | `POST` | Delete a draft PR comment by ID                                     | JSON (`{ok: true}`)                        |
+| `/api/pr/submit`      | `POST` | Submit review comments to forge API (`APPROVE`, `REQUEST_CHANGES`, etc.)| JSON (`{ok: true}`)                        |
+| `/api/pr/launch`      | `POST` | Launch PR workspace in Review Workbench                                 | JSON (`{ok, port, url}`)                   |
+| `/api/pr/existing-comments` | `GET` | Fetch existing published review comments from forge API            | JSON array of comments                     |
+| `/api/pr/comments/issue` | `POST` | Post a top-level conversation comment to the PR                        | JSON (`{ok: true}`)                        |
+| `/api/pr/comments/review-reply` | `POST` | Reply to an existing PR review comment thread                  | JSON (`{ok: true}`)                        |
+| `/api/pr/merge-status`| `GET`  | Fetch PR mergeability status and allowed merge methods                  | JSON (`{canMerge, state, methods, ...}`)   |
+| `/api/pr/merge`       | `POST` | Merge PR using chosen method (`merge`, `squash`, `rebase`)              | JSON (`{merged, message, sha}`)            |
+| `/api/pr/merge-message` | `POST`| Dispatch harness to generate PR merge/squash message                    | JSON job snapshot                          |
+| `/api/forge/connect`  | `POST` | Test and persist forge API access token                                 | JSON (`{ok, user, host}`)                  |
+| `/api/session`        | `GET` / `POST` | Load or persist workspace UI session state (tabs, scroll, drafts) | JSON session data                        |
 
 ## 4. Memory Management & Proactive Scavenging
 
@@ -181,6 +250,32 @@ The `/api/lsp/install` and `/api/lsp/start` endpoints execute shell commands (e.
 1. The request `Origin` header must match the request `Host` header.
 1. The `Host` header is validated to ensure it is strictly an IP address (`127.0.0.1`, `[::1]`) or `localhost`. This prevents DNS-rebinding attacks.
 1. The executed command is never supplied by the client; it is looked up exclusively from the hard-coded internal `lspRegistry`, or, for agent edits, from the harness the user picked (only the instruction text comes from the client).
+
+### Content Security Policy (CSP)
+
+`ServeHTTP` sets a strict `Content-Security-Policy` header on all responses to mitigate Cross-Site Scripting (XSS) and data exfiltration in depth:
+
+- `default-src 'self';`
+- `script-src 'self';` (disallows inline scripts; blocks injected `<script>` tags and event handlers)
+- `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;` (allows Google Fonts and dynamic UI styling)
+- `font-src 'self' https://fonts.gstatic.com;`
+- `img-src 'self' data: https: http:;` (supports icons, data URI previews, and external markdown images)
+- `connect-src 'self';` (prevents exfiltration to third-party endpoints)
+- `object-src 'none';`
+- `base-uri 'self';` (allows `<base href="...">` routing while preventing base-tag hijacking)
+- `frame-ancestors 'none';` (guards against clickjacking)
+- `form-action 'none';`
+
+The pinned Mermaid browser runtime is fetched on demand at runtime and cached under the user cache directory (`~/.px0/cache/vendor/` or `$XDG_CACHE_HOME/px0/vendor/`). When a Markdown preview containing a Mermaid fence is rendered, the frontend requests `/static/vendor/mermaid-12.0.0.min.js`, which `server.go` serves same-origin from the local cache (downloading and caching from the pinned CDN release on first use if absent). This keeps the compiled executable lean while satisfying the strict same-origin `'self'` CSP, preventing exfiltration, and preserving full offline capability for subsequent sessions.
+
+### Binary Size Optimization & Packaging Footprint
+
+px0 employs several complementary strategies to maintain an ultra-lean binary footprint (~12 MB) without runtime packing or startup overhead:
+
+1. **Compile-time Trimming & Stripping**: Binaries are built with `-trimpath` and `-ldflags="-s -w"`, removing host filesystem paths, symbol tables, and DWARF debug sections.
+2. **Runtime Offloading of Heavy Vendor Assets**: Bulky third-party vendor assets (such as the 1.6 MB gzipped / 4 MB uncompressed Mermaid diagramming bundle) are excluded from `go:embed`. Instead, they are downloaded on-demand and cached in volatile/persistent user storage outside the repository, served via same-origin streaming handlers.
+3. **Frontend Bundle Minification**: Frontend assets (`web/app.js`) are bundled with `--minify` via Bun, reducing uncompressed client JavaScript from ~448 KB to ~250 KB.
+4. **Standard Executable Integrity**: Executables are distributed as native, unpacked binaries rather than using runtime packers (e.g., UPX), preventing antivirus false positives, ensuring compatibility across all platforms (macOS Gatekeeper, OpenBSD W^X, BSDs, Windows ARM64), and enabling the operating system to share read-only executable pages across multiple running processes.
 
 ### Self-Update Integrity
 

@@ -1,11 +1,11 @@
 // web/src/main.js
 import { $, S, api, applyKeyLabels } from './state.js';
 import { measure, layout, render, initRenderer, updateEditorOptionControls } from './renderer.js';
-import { initTabs, openFile, restoreWorkspaceTabs, switchTab } from './tabs.js';
+import { initTabs, openFile, switchTab } from './tabs.js';
 import { initCursor } from './cursor.js';
 import { initHover } from './hover.js';
 import { initSelectionBar } from './selbar.js';
-import { drawTree, treeEl, initTree, revealFile, refreshTree, restoreOpenDirs, setSidebarMode, updateSidebarToggleState } from './tree.js';
+import { drawTree, treeEl, initTree, revealFile, refreshTree, collapseAllDirs, expandDirtyDirs, inGitMode, setAutoRevealSuppressed, setSidebarMode, updateSidebarToggleState, hasGitView } from './tree.js';
 import { initSearch } from './search.js';
 import { initOutline } from './outline.js';
 import { initPanels } from './panels.js';
@@ -19,18 +19,28 @@ import { initMarkdown } from './markdown.js';
 import { initDiff } from './diff.js';
 import { initAgent, applyAgentMeta, loadAgentAsync } from './agent.js';
 import { initThreads } from './thread.js';
-import { initMetrics, initStatusFit, initStatus, updateMetricsDisplay, updateStatus } from './status.js';
+import { initMetrics, initStatus, initLspMenu, refreshLspMenu, initStatusFit, updateMetricsDisplay, updateStatus } from './status.js';
 import { initSettings } from './settings.js';
 import { initVim } from './vim.js';
 import { initImageViewer } from './imageview.js';
-import { initGitStream } from './gitstream.js';
-import { initGitPanel } from './gitpanel.js';
+import { initGitStream, triggerRefresh } from './gitstream.js';
+import { initGitPanel, syncGitPanelMeta } from './gitpanel.js';
 import { initPR } from './pr.js';
 import { initLineComment } from './linecomment.js';
+import { initUnpushed, refreshUnpushed } from './unpushed.js';
+import { initPRScope } from './prscope.js';
+import { initEditView } from './editview.js';
+import { initNewItem } from './newitem.js';
+import { initTips, startTipsAsync } from './tips.js';
+import { initReviewFlow } from './reviewflow.js';
 
 // Initialize all subsystems
 initRenderer();
 initTabs();
+initEditView();
+initNewItem();
+initTips();
+initReviewFlow();
 initCursor();
 initHover();
 initSelectionBar();
@@ -50,11 +60,14 @@ initAgent();
 initThreads();
 initMetrics();
 initStatus();
+initLspMenu();
 initStatusFit();
 initSettings();
 initVim();
 initImageViewer();
 initLineComment();
+initUnpushed();
+initPRScope();
 
 // Bootstrap application lifecycle
 (async function boot() {
@@ -73,8 +86,8 @@ initLineComment();
     // Restore Markdown preview (default ON)
     const mdPref = localStorage.getItem('px0.mdPreview');
     S.mdPreview = mdPref !== null ? mdPref === 'true' : true;
-
-    // Restore HTML preview (default ON)
+    const tablePref = localStorage.getItem('px0.tablePreview');
+    S.tablePreview = tablePref !== null ? tablePref === 'true' : true;
     const htmlPref = localStorage.getItem('px0.htmlPreview');
     S.htmlPreview = htmlPref !== null ? htmlPref === 'true' : true;
 
@@ -86,22 +99,35 @@ initLineComment();
   measure();
   S.meta = await api('/api/meta');
   if (S.meta.metrics) updateMetricsDisplay(S.meta.metrics);
+  refreshLspMenu();
   updateSidebarToggleState();
+  syncGitPanelMeta();
   applyAgentMeta();
   initPR();
   document.title = S.meta.name + ' - px0';
   $('#root-name').textContent = S.meta.name;
   $('#root-name').title = S.meta.root;
+  if (S.meta.workbench) {
+    // Opened from the workbench (workbench.go): link back to it.
+    const back = document.createElement('a');
+    back.className = 'mini wb-back';
+    back.href = S.meta.workbench;
+    back.title = 'Back to the px0 workbench';
+    back.setAttribute('aria-label', 'Back to the px0 workbench');
+    back.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>';
+    $('#root-name').before(back);
+  }
   if (S.meta.version) {
     const emptyVerEl = $('#empty-ver');
     if (emptyVerEl) emptyVerEl.textContent = 'v' + S.meta.version;
-  }
-  try {
-    const session = await api('/api/session');
-    if (session && Array.isArray(session.openDirs) && session.openDirs.length > 0) {
-      restoreOpenDirs(session.openDirs);
+    const stVerEl = $('#st-ver');
+    if (stVerEl) {
+      stVerEl.textContent = 'v' + S.meta.version;
+      stVerEl.title = `px0 v${S.meta.version} (Click for shortcuts & help)`;
     }
-  } catch {}
+  }
+  updateStatus();
+  setAutoRevealSuppressed(true);
   await refreshTree();
   initGitStream();
 
@@ -111,13 +137,12 @@ initLineComment();
   // completes (common right after `px0 <pr-url>`) would otherwise never
   // auto-select a diff tab -- until the next manual reload.
   const applyGitSidebarState = async () => {
-    const hasGitChanges = !!(S.meta?.git && S.meta.gitChanges > 0);
-    if (hasGitChanges) {
-      await setSidebarMode('git');
-    } else {
-      await setSidebarMode('files');
-    }
-    return hasGitChanges;
+    // The unpushed list decides this too: a clean tree with local commits
+    // still belongs in Git view, which is the only place they are listed.
+    await refreshUnpushed();
+    const showGit = hasGitView();
+    await setSidebarMode(showGit ? 'git' : 'files', { expandDirty: showGit });
+    return !!(S.meta?.git && ((S.meta.gitChanges > 0) || S.meta?.pr));
   };
   const selectChangedFileTab = async () => {
     if (S.tabs[S.active]?.diffAvailable) return;
@@ -126,7 +151,6 @@ initLineComment();
       switchTab(changedTabIdx);
     } else if (S.meta.gitFiles && S.meta.gitFiles.length > 0) {
       await openFile(S.meta.gitFiles[0]);
-      await revealFile(S.meta.gitFiles[0]);
     }
   };
 
@@ -137,7 +161,6 @@ initLineComment();
   const initialLine = parseInt(params.get('line'), 10) || undefined;
   if (initialPath) {
     await openFile(initialPath, { line: initialLine });
-    await revealFile(initialPath);
     try {
       const u = new URL(window.location.href);
       u.searchParams.delete('path');
@@ -147,9 +170,17 @@ initLineComment();
       window.history.replaceState({}, '', cleanUrl);
     } catch {}
   } else {
-    await restoreWorkspaceTabs();
     if (hasGitChanges) await selectChangedFileTab();
   }
+
+  if (inGitMode()) {
+    await expandDirtyDirs();
+    const activeDoc = S.tabs[S.active];
+    if (activeDoc?.path) await revealFile(activeDoc.path);
+  } else {
+    collapseAllDirs();
+  }
+  setAutoRevealSuppressed(false);
 
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(() => { measure(); layout(); render(); });
@@ -164,11 +195,24 @@ initLineComment();
         if (m.ready) {
           clearInterval(timer);
           S.meta = m;
+          updateSidebarToggleState();
+          syncGitPanelMeta();
           updateStatus();
+          setAutoRevealSuppressed(true);
+          await refreshTree();
+          await triggerRefresh();
           if (!initialPath) {
             hasGitChanges = await applyGitSidebarState();
             if (hasGitChanges) await selectChangedFileTab();
+            if (inGitMode()) {
+              await expandDirtyDirs();
+              const activeDoc = S.tabs[S.active];
+              if (activeDoc?.path) await revealFile(activeDoc.path);
+            } else {
+              collapseAllDirs();
+            }
           }
+          setAutoRevealSuppressed(false);
         }
       } catch {
         clearInterval(timer);
@@ -178,4 +222,7 @@ initLineComment();
 
   // Load harnesses and models asynchronously after the browser is loaded.
   loadAgentAsync();
+
+  // Load and asynchronously display tips
+  startTipsAsync();
 })();

@@ -1,6 +1,6 @@
 # Filesystem Indexing & Ignore Engine
 
-This document explains the technical implementation of px0's in-memory indexer ([`index.go`](../../index.go)) and custom `.gitignore` evaluation engine ([`ignore.go`](../../ignore.go)).
+This document explains the technical implementation of px0's in-memory indexer ([`index.go`](../../index.go)) and custom `.gitignore` evaluation engine ([`internal/ignore/ignore.go`](../../internal/ignore/ignore.go)).
 
 ## 1. Directory Traversal Architecture
 
@@ -97,8 +97,9 @@ type FileEntry struct {
 }
 ```
 
-- Precomputed Lowercase (`lower`): Computed once during traversal. Fuzzy matching and case-insensitive queries run directly against this slice without string allocations during user typing.
+- Precomputed Lowercase (`lower`): Computed once during traversal (reusing the original `Path` string when already lowercase). Fuzzy matching and case-insensitive queries run directly against this slice without string allocations during user typing.
 - `nameStart`: Caches the byte offset of the basename (e.g., `src/components/Button.tsx` $\to 15$). This allows the fuzzy scoring matrix to award basename match bonuses without runtime string splitting.
+- Batched Directory Appends & Sorting: During `Index.Build()`, each worker collects a directory's `FileEntry` values locally and appends them under a single mutex acquisition along with `ix.children[rel]`. Directory entries (`sortNodes`) are ordered using a zero-allocation case-insensitive ASCII comparator (`lessFoldASCII`).
 
 ### `Node` (Explorer Tree Representation)
 
@@ -116,7 +117,7 @@ type Node struct {
 
 ## 3. High-Performance `.gitignore` Engine
 
-Evaluating regular expressions for hundreds of `.gitignore` patterns against tens of thousands of paths can cripple indexing performance. In [`ignore.go`](../../ignore.go), px0 classifies patterns into specialized non-regex fast paths and adds heuristic pre-filters to regexes.
+Evaluating regular expressions for hundreds of `.gitignore` patterns against tens of thousands of paths can cripple indexing performance. In [`internal/ignore/ignore.go`](../../internal/ignore/ignore.go), px0 classifies patterns into specialized non-regex fast paths and adds heuristic pre-filters to regexes.
 
 ### Rule Classification (`ruleKind`)
 
@@ -152,7 +153,7 @@ Directories can contain nested `.gitignore` files that override or extend parent
 
 - `ignoreSet` forms a linked tree where child directories point to their parent `ignoreSet`.
 - When entering a directory containing a `.gitignore`, a child set is constructed with `ig.child(readGitignore(abs, rel))`.
-- Rules are evaluated from child to root, respecting negation patterns (`!file.txt`).
+- Because gitignore semantics are last-match-wins, `IgnoreSet.Match` iterates rules in reverse (`len(s.Rules)-1` down to `0`) and returns `!r.Negate` on the first match.
 
 ## 4. Ignored Directory Semantics (Listing vs. Descent)
 
@@ -162,4 +163,4 @@ px0 implements a clear distinction between ignored entries and version control i
 1. Ignored Directories (`node_modules/`, `target/`, etc.): Added to the parent node listing with `Ignored: true`. Never descended into during `Index.Build()`. Never entered into the flat `files` slice used by fuzzy find and workspace search. The file explorer displays them with dimmed opacity.
 1. On-Demand Expansion (`Index.Children` & `listIgnored`): If the user clicks to expand an ignored folder in the explorer sidebar, `Children()` detects that the directory was ignored and reads only that single directory from disk on demand (`os.ReadDir`). Every child inside it is marked `Ignored: true`, adhering to git semantics: nothing beneath an excluded directory can be re-included. Traversal protection (`underIgnoredLocked`) ensures that crafted paths with `.` or `..` segments are rejected before accessing the filesystem.
 
-The explorer's Expand All action follows the same `/api/tree` path for each indexed directory. It requests at most four directories at a time and adds their children to a queue. It skips ignored directories, whose on-demand listing could otherwise traverse generated trees such as `node_modules`; they remain available for manual expansion. Collapse All, a manual folder click, revealing a file, a tree refresh, or switching to Git Changes invalidates the running expansion so late responses cannot reopen the tree. Open directory paths are saved through `/api/session` when expansion finishes or is collapsed.
+The explorer's Expand All action follows the same `/api/tree` path for each indexed directory. It requests at most four directories at a time and adds their children to a queue. It skips ignored directories, whose on-demand listing could otherwise traverse generated trees such as `node_modules`; they remain available for manual expansion. Collapse All, a manual folder click, revealing a file, a tree refresh, or switching to Git Changes invalidates the running expansion so late responses cannot reopen the tree. Expanded folders are not saved: a reload starts with the tree collapsed.

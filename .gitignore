@@ -1,6 +1,7 @@
 dist/
 bench-repos/
 px0
+px0.exe
 *.test
 *.prof
 
@@ -19,6 +20,9 @@ Thumbs.db
 # Build artifacts
 build/
 web/app.js
+web/workbench.js
+web/vendor/*.min.js
+web/vendor/*.min.js.gz
 
 # Logs
 *.log

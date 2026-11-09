@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,16 +16,25 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"px0/internal/settings"
+	"px0/internal/telemetry"
+	"px0/internal/ui"
+	"px0/internal/update"
 )
 
 //go:embed VERSION
 var rawVersion string
 
 var version = strings.TrimSpace(rawVersion)
+
+// posthogKey can be injected at build time: go build -ldflags="-X main.posthogKey=phc_..."
+var posthogKey string
 
 func main() {
 	var (
@@ -33,35 +43,36 @@ func main() {
 		noOpen       = flag.Bool("no-open", false, "do not launch a browser")
 		noLSP        = flag.Bool("no-lsp", false, "do not use language servers, even if installed")
 		noGit        = flag.Bool("no-git", false, "disable git awareness")
-		dev          = flag.String("dev", "", "serve the UI from this source directory instead of the embedded copy")
 		showVer      = flag.Bool("version", false, "print version and exit")
 		showVerShort = flag.Bool("v", false, "print version and exit (shorthand)")
 		doUpdate     = flag.Bool("update", false, "check for and install latest version of px0")
+		noUpdate     = flag.Bool("no-update", false, "do not auto-update px0 on startup")
 		noColor      = flag.Bool("no-color", false, "disable colour output")
 		quiet        = flag.Bool("quiet", false, "suppress narration")
-		verbose      = flag.Bool("verbose", false, "log requests, searches, symbols, and agent prompts to terminal")
+		verbose      = flag.Bool("verbose", false, "log startup steps, requests, searches, symbols, and agent prompts to terminal")
 		noTelemetry  = flag.Bool("no-telemetry", false, "disable anonymous usage telemetry")
 		agentCmd     = flag.String("agent", "", "pin the coding harness used for edits (claude, gemini, cursor-agent, agy, opencode, codex, aider, goose, or a command template containing {prompt}); detected and chosen in the UI when omitted")
 		noAgent      = flag.Bool("no-agent", false, "do not offer editing through a coding harness")
 		_            = flag.Bool("y", false, "answer yes to prompts (deprecated; PRs are always opened without prompt)")
 		_            = flag.Bool("yes", false, "answer yes to prompts (alias for -y)")
 		basePathFlag = flag.String("base-path", "", "base URL path prefix to serve endpoints and assets from (e.g. /rev-123/)")
+		wbChild      = flag.Bool("workbench-child", false, "internal: run as a workspace of the px0 workbench")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage:\n  px0 [flags] [file or directory]\n  px0 [flags] <pr-url>\n\nflags:\n", version)
+		fmt.Fprintf(os.Stderr, "px0 %s - a code navigator\n\nusage:\n  px0 [flags]                      open the workbench\n  px0 [flags] <file or directory>\n  px0 [flags] <pr-url>\n\nflags:\n", version)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
 	if *noColor {
 		f := false
-		uiForcedColor = &f
+		ui.ForcedColor = &f
 	}
-	if *quiet {
-		uiQuiet = true
+	if *quiet || *wbChild {
+		ui.Quiet = true
 	}
 	if *verbose {
-		uiVerbose = true
+		ui.Verbose = true
 	}
 	if *noGit {
 		gitDisabled = true
@@ -73,19 +84,32 @@ func main() {
 	}
 
 	if *doUpdate {
-		if err := runSelfUpdate(version); err != nil {
+		if err := update.RunSelfUpdate(version); err != nil {
 			fatal(err)
 		}
 		return
 	}
 
-	if *dev != "" {
-		if err := useDiskAssets(*dev); err != nil {
-			fatal(fmt.Errorf("-dev %s: %w", *dev, err))
+	// Without a target, px0 opens the workbench: a launcher for directories
+	// and pull requests that runs each one as a child px0 (workbench.go).
+	if flag.NArg() == 0 && !*wbChild {
+		var childArgs []string
+		for _, f := range []struct {
+			on   bool
+			flag string
+		}{{*noLSP, "-no-lsp"}, {*noGit, "-no-git"}, {*noAgent, "-no-agent"}, {*noTelemetry, "-no-telemetry"}} {
+			if f.on {
+				childArgs = append(childArgs, f.flag)
+			}
 		}
+		if *agentCmd != "" {
+			childArgs = append(childArgs, "-agent", *agentCmd)
+		}
+		runWorkbench(*host, *port, *basePathFlag, !*noOpen, !*noUpdate, childArgs)
+		return
 	}
 
-	// A full pull request URL (e.g. https://github.com/owner/repo/pull/123)
+	// A full pull or merge request URL (see prURLExamples)
 	// checks out the PR's full source tree instead of resolving a local file/directory.
 	// Only full URLs via "px0 <url>" are supported for PR review.
 	target := "."
@@ -110,10 +134,20 @@ func main() {
 	var pr *prSession
 	var root, initialFile string
 	var initialLine int
+	var targetDur time.Duration
 	if isPR {
-		sp := newSpinner(fmt.Sprintf("Preparing PR #%d (%s/%s)...", prTarget.Number, prTarget.Owner, prTarget.Repo), os.Stdout)
+		sp := ui.NewSpinner(fmt.Sprintf("Preparing PR #%d (%s/%s)...", prTarget.Number, prTarget.Owner, prTarget.Repo), os.Stdout)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		p, err := checkoutPR(ctx, prProvider, prTarget, ".", func(msg string) {
+		// Outside a clone of the PR's repository, use one the workbench knows,
+		// so the checkout is a worktree rather than a fresh clone.
+		cloneDir := "."
+		if top, _ := findPRRemote(".", prTarget.Owner, prTarget.Repo); top == "" {
+			st := &wbStore{path: workbenchStorePath()}
+			if known := knownClone(st.Load(), prTarget.Owner+"/"+prTarget.Repo); known != "" {
+				cloneDir = known
+			}
+		}
+		p, err := checkoutPR(ctx, prProvider, prTarget, cloneDir, func(msg string) {
 			sp.Update(msg)
 		})
 		cancel()
@@ -129,31 +163,46 @@ func main() {
 		pr = p
 		root = p.Root()
 	} else {
+		tStart := time.Now()
 		r, f, l, err := resolveTarget(target)
 		if err != nil {
 			fatal(err)
 		}
+		targetDur = time.Since(tStart)
 		root, initialFile, initialLine = r, f, l
 	}
 
+	tListen := time.Now()
 	ln, addr, err := listen(*host, *port)
 	if err != nil {
 		fatal(err)
 	}
+	listenDur := time.Since(tListen)
 
+	tInit := time.Now()
 	ix := NewIndex(root)
 	lsp := newLSPManager(root, !*noLSP)
-	tel := NewTelemetryService(*noTelemetry)
+	tel := telemetry.New(posthogKey, version, *noTelemetry)
 	defer tel.Close("normal")
 
 	configuredBasePath := "/"
 	if *basePathFlag != "" {
 		configuredBasePath = cleanBasePath(*basePathFlag)
-	} else if cfg := readSettings(); cfg.ServerBasePath != nil && *cfg.ServerBasePath != "" {
+	} else if cfg := settings.Read(); cfg.ServerBasePath != nil && *cfg.ServerBasePath != "" {
 		configuredBasePath = cleanBasePath(*cfg.ServerBasePath)
 	}
 
 	pxSrv := NewServer(ix, lsp, configuredBasePath)
+	pxSrv.tel = tel
+	if *wbChild {
+		pxSrv.workbenchURL = workbenchBaseOf(configuredBasePath)
+	} else if pr != nil {
+		it := wbPRItem(prTarget)
+		it.Title = pr.meta.Title
+		go recordRecent(it)
+	} else {
+		go recordRecent(wbDirItem(root))
+	}
 	if pr != nil {
 		pxSrv.SetPR(pr)
 	}
@@ -165,39 +214,75 @@ func main() {
 		}
 		pxSrv.SetAgent(agent)
 	}
+	initDur := time.Since(tInit)
 
 	srv := &http.Server{Handler: pxSrv}
+	srv.RegisterOnShutdown(pxSrv.EndStreams)
+	if *wbChild {
+		// The workbench reads this line for the address it proxies to.
+		fmt.Printf("%s%s\n", wbReadyPrefix, addr)
+	}
 
 	url := viewerURL(addr, initialFile, initialLine, configuredBasePath)
-	uiHeading("px0 "+version, nil, os.Stdout)
+	ui.Heading("px0 "+version, nil, os.Stdout)
 	if pr != nil {
 		prTitle := fmt.Sprintf("#%d %s", pr.meta.Number, pr.meta.Title)
 		if pr.meta.Merged {
-			prTitle += " " + paint("[MERGED]", colorWarn, true, os.Stdout)
+			prTitle += " " + ui.Paint("[MERGED]", ui.ColorWarn, true, os.Stdout)
 		}
-		uiKV("PR", prTitle, 11, os.Stdout)
+		ui.KV("PR", prTitle, 11, os.Stdout)
 		if pr.token == "" {
-			uiKV("access", uiDim(fmt.Sprintf("read-only (no %s token: set GITHUB_TOKEN or gh auth login to submit reviews)", pr.provider.Name()), os.Stdout), 11, os.Stdout)
+			ui.KV("access", ui.Dim(fmt.Sprintf("read-only (no %s token: %s to submit reviews)", pr.provider.Info().Label, pr.provider.Info().TokenHint), os.Stdout), 11, os.Stdout)
 		}
 	}
-	uiKV("workspace", root, 11, os.Stdout)
-	uiKV("url", uiAccent(url, os.Stdout), 11, os.Stdout)
-	uiHint("ctrl-c to stop", os.Stdout)
+	ui.KV("workspace", root, 11, os.Stdout)
+	ui.KV("url", ui.Accent(url, os.Stdout), 11, os.Stdout)
+	if *host == "0.0.0.0" {
+		for _, networkURL := range networkURLs(addr, initialFile, initialLine) {
+			ui.KV("network", ui.Accent(networkURL, os.Stdout), 11, os.Stdout)
+		}
+	}
+	ui.Hint("ctrl-c to stop", os.Stdout)
+
+	if ui.Verbose {
+		if !isPR {
+			ui.Status("ok", "resolved workspace target", ui.FmtDuration(targetDur), 0, os.Stdout)
+		}
+		ui.Status("ok", fmt.Sprintf("bound TCP listener on %s", addr), ui.FmtDuration(listenDur), 0, os.Stdout)
+		ui.Status("ok", "initialized HTTP server and services", ui.FmtDuration(initDur), 0, os.Stdout)
+	}
 
 	// Launch browser immediately without blocking startup.
 	if !*noOpen {
+		tBrowser := time.Now()
 		go openBrowser(url)
+		if ui.Verbose {
+			ui.Status("ok", "spawned browser launcher", ui.FmtDuration(time.Since(tBrowser)), 0, os.Stdout)
+		}
 	}
 
 	// Index workspace asynchronously so the server and UI respond in <1ms.
 	go func() {
 		ix.Build()
+		if pxSrv.gitWatcher != nil {
+			pxSrv.gitWatcher.Trigger()
+		}
 		n, _, ms := ix.Stats()
-		uiStatus("ok", fmt.Sprintf("indexed %d files", n), fmt.Sprintf("%dms", ms), 0, os.Stdout)
-		if names := lsp.Available(); len(names) > 0 {
-			uiBullet(fmt.Sprintf("language servers: %s (started on first use)", strings.Join(names, ", ")), os.Stdout)
+		ui.Status("ok", fmt.Sprintf("indexed %d files", n), fmt.Sprintf("%dms", ms), 0, os.Stdout)
+		tLSP := time.Now()
+		names := lsp.Available()
+		lspDur := time.Since(tLSP)
+		if len(names) > 0 {
+			if ui.Verbose {
+				ui.Status("ok", fmt.Sprintf("discovered language servers: %s", strings.Join(names, ", ")), ui.FmtDuration(lspDur), 0, os.Stdout)
+			} else {
+				ui.Bullet(fmt.Sprintf("language servers: %s (started on first use)", strings.Join(names, ", ")), os.Stdout)
+			}
+		} else if ui.Verbose {
+			ui.Status("ok", "checked language servers (none installed)", ui.FmtDuration(lspDur), 0, os.Stdout)
 		}
 		if agent != nil {
+			tAgent := time.Now()
 			var found []string
 			for _, h := range agent.Detect() {
 				if h.Installed {
@@ -208,32 +293,49 @@ func main() {
 					found = append(found, item)
 				}
 			}
-			if uiVerbose && len(found) > 0 {
-				uiStatus("info", uiInfo("coding harnesses: "+strings.Join(found, ", "), os.Stdout), "", 0, os.Stdout)
+			agentDur := time.Since(tAgent)
+			if ui.Verbose {
+				if len(found) > 0 {
+					ui.Status("ok", fmt.Sprintf("detected coding harnesses: %s", strings.Join(found, ", ")), ui.FmtDuration(agentDur), 0, os.Stdout)
+				} else {
+					ui.Status("ok", "checked coding harnesses (none found)", ui.FmtDuration(agentDur), 0, os.Stdout)
+				}
 			}
 		}
 
 		tel.Track("session_started", map[string]any{
-			"files_bucket": filesBucket(n),
+			"files_bucket": telemetry.FilesBucket(n),
 			"index_ms":     ms,
 			"has_git":      gitAvailable(root),
 			"has_lsp":      len(lsp.Available()) > 0,
 		})
 	}()
 
-	// Check for updates asynchronously once a day without delaying startup (<1ms).
-	go checkDailyUpdate(version)
+	// Check for updates in the background once the server is already up, so
+	// px0 never makes a network call before serving the first request.
+	if !*noUpdate {
+		go update.AutoUpdate(version)
+	}
 
 	// Language servers are children that can hold gigabytes. Shut them down on
 	// the way out rather than leaving them for the OS to reap.
 	interrupted := false
+	shutDown := make(chan struct{}) // closes once Shutdown has drained every request
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	if *wbChild {
+		// The workbench holds our stdin open; it closes when the workbench
+		// stops this workspace or exits for any reason.
+		go func() {
+			io.Copy(io.Discard, os.Stdin)
+			stop <- syscall.SIGTERM
+		}()
+	}
 	go func() {
 		<-stop
 		interrupted = true
 		fmt.Print("\r")
-		uiStatus("info", "px0 stopped", "", 0, os.Stderr)
+		ui.Status("info", "px0 stopped", "", 0, os.Stderr)
 		go func() {
 			<-stop // Second interrupt forces immediate exit
 			os.Exit(130)
@@ -241,9 +343,15 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		close(shutDown)
 	}()
 
 	err = srv.Serve(ln)
+	if err == http.ErrServerClosed {
+		// Serve returns as soon as Shutdown starts; exiting then would cut
+		// the responses it is still draining.
+		<-shutDown
+	}
 	lsp.Close()
 	agent.Close()
 	pxSrv.CloseThreads()
@@ -258,6 +366,104 @@ func main() {
 	if err != nil && err != http.ErrServerClosed {
 		fatal(err)
 	}
+}
+
+// runWorkbench serves the workbench until interrupted, then stops every
+// workspace it started.
+func runWorkbench(host string, port int, basePathFlag string, open, doAutoUpdate bool, childArgs []string) {
+	if u := runningWorkbench(); u != "" {
+		ui.Status("ok", "workbench already running", u, 0, os.Stdout)
+		if open {
+			openBrowser(u)
+		}
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		fatal(err)
+	}
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		cwd = resolved
+	}
+	basePath := "/"
+	if basePathFlag != "" {
+		basePath = cleanBasePath(basePathFlag)
+	} else if cfg := settings.Read(); cfg.ServerBasePath != nil && *cfg.ServerBasePath != "" {
+		basePath = cleanBasePath(*cfg.ServerBasePath)
+	}
+
+	ln, addr, err := listen(host, port)
+	if err != nil {
+		fatal(err)
+	}
+	wb := newWorkbench(basePath, cwd, exe, childArgs)
+	srv := &http.Server{Handler: wb}
+
+	u := viewerURL(addr, "", 0, basePath)
+	_, boundPort, _ := net.SplitHostPort(addr)
+	writeWorkbenchLock(viewerURL(net.JoinHostPort("127.0.0.1", boundPort), "", 0, basePath))
+	defer removeWorkbenchLock()
+
+	ui.Heading("px0 "+version, nil, os.Stdout)
+	ui.KV("workbench", ui.Accent(u, os.Stdout), 11, os.Stdout)
+	if host == "0.0.0.0" {
+		for _, networkURL := range networkURLs(addr, "", 0) {
+			ui.KV("network", ui.Accent(networkURL, os.Stdout), 11, os.Stdout)
+		}
+	}
+	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		ui.Status("warn", "anyone who can reach this address can browse and open any directory on this machine", "", 0, os.Stdout)
+	}
+	ui.Hint("ctrl-c to stop", os.Stdout)
+	if open {
+		go openBrowser(u)
+	}
+	if doAutoUpdate {
+		go update.AutoUpdate(version)
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	interrupted := false
+	go func() {
+		<-stop
+		interrupted = true
+		fmt.Print("\r")
+		ui.Status("info", "px0 stopped", "", 0, os.Stderr)
+		go func() {
+			<-stop
+			os.Exit(130)
+		}()
+		// Children first: their open event streams would hold Shutdown up.
+		wb.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+	err = srv.Serve(ln)
+	wb.Close()
+	if interrupted {
+		removeWorkbenchLock()
+		os.Exit(130)
+	}
+	if err != nil && err != http.ErrServerClosed {
+		removeWorkbenchLock()
+		fatal(err)
+	}
+}
+
+// workbenchBaseOf turns a workspace's base path (/<wb>/w/<id>/) back into the
+// workbench's own.
+func workbenchBaseOf(childBase string) string {
+	trimmed := strings.TrimSuffix(childBase, "/")
+	if i := strings.LastIndex(trimmed, "/w/"); i >= 0 {
+		return trimmed[:i+1]
+	}
+	return "/"
 }
 
 // resolveTarget turns a directory or file into a workspace root, along with an optional
@@ -365,6 +571,53 @@ func viewerURL(addr, initialFile string, initialLine int, basePath ...string) st
 		u.RawQuery = q.Encode()
 	}
 	return u.String()
+}
+
+// networkURLs returns URLs for the machine's non-loopback IPv4 addresses.
+// The supplied address contributes the bound port; its host is intentionally
+// ignored because a bind address is not necessarily a usable destination.
+func networkURLs(addr, initialFile string, initialLine int) []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	return networkURLsFromAddrs(addr, initialFile, initialLine, addrs)
+}
+
+func networkURLsFromAddrs(addr, initialFile string, initialLine int, addrs []net.Addr) []string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	urls := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		var ip net.IP
+		switch a := addr.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		default:
+			continue
+		}
+
+		ip = ip.To4()
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			continue
+		}
+
+		host := ip.String()
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		urls = append(urls, viewerURL(net.JoinHostPort(host, port), initialFile, initialLine))
+	}
+
+	sort.Strings(urls)
+	return urls
 }
 
 // listen binds the requested port, walking forward if it is already taken so a

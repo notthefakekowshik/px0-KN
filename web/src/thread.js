@@ -1,11 +1,16 @@
 // web/src/thread.js
-import { $, $$, esc, doc_, api, apiPost, apiPostJson, applyKeyLabels } from './state.js';
+import { $, $$, S, esc, doc_, api, apiPost, apiPostJson, applyKeyLabels } from './state.js';
 import { on } from './bus.js';
 import { showToast, copyToClipboard } from './ui.js';
 import { openFile } from './tabs.js';
 import { setThreadHandler, hideSelectionBar } from './selbar.js';
-import { showRightInspector } from './inspector.js';
+import { hideRightInspector } from './inspector.js';
+import { layout, render } from './renderer.js';
 import { registerAgentPicker, reloadWorkspace } from './agent.js';
+import { onStream, setStreamTopic, watchThread } from './stream.js';
+
+const COPY_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5V3a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg>';
+const COPIED_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3.5 8.5 6.5 11.5 12.5 5.5"/></svg>';
 
 /* A thread is a long-running conversation with the coding harness, kept on the
    server. It starts from a spot in the code but is not limited to it: the
@@ -15,11 +20,11 @@ import { registerAgentPicker, reloadWorkspace } from './agent.js';
    than one-shot inline edits.
 
    The right sidebar has two views: the list of threads, and one open thread
-   (or a new draft) with its transcript and composer. Two event streams feed it:
-   one for the list, which also tells the editor when a finished turn changed
-   files so open tabs reload, and one per open thread, carrying the reply as it
-   is written. Both are server-sent events, so a dropped connection simply
-   reconnects to a fresh snapshot. */
+   (or a new draft) with its transcript and composer. Two feeds on the tab's
+   shared event stream (stream.js) drive it: the list, which also tells the
+   editor when a finished turn changed files so open tabs reload, and the open
+   thread, carrying the reply as it is written. A dropped connection simply
+   reconnects to a fresh snapshot of both. */
 
 const thr = {
   avail: false,
@@ -27,12 +32,12 @@ const thr = {
   filter: 'all',      // all | file
   cur: null,          // the open thread, as last received
   draft: null,        // {path, l1, l2} for a thread not yet created, or {} for a workspace-level one
-  listEs: null,
-  threadEs: null,
+  opening: null,      // id of the thread being fetched, so a late reply for another one is dropped
+  threadId: null,     // id of the thread whose live events we follow
+  releaseThread: null,
   sending: false,
 };
 
-const thrUrl = p => new URL(p, document.baseURI || location.href).href;
 const thrRefText = t => t.path ? t.path + ':' + (t.l1 === t.l2 ? t.l1 : t.l1 + '-' + t.l2) : 'Workspace';
 
 function thrAgo(ms) {
@@ -65,7 +70,13 @@ function thrInline(src) {
   const codes = [];
   // 1. Extract inline code spans first so nothing inside is formatted
   let s = src.replace(/(`+)([\s\S]*?[^`])\1(?!`)/g, (_, q, code) => {
-    codes.push('<code>' + esc(code.trim()) + '</code>');
+    const trimmed = code.trim();
+    const m = /^([a-zA-Z0-9_.\-/]+\.[a-zA-Z0-9]+)(?::(\d+)(?:-(\d+))?)?$/.exec(trimmed);
+    if (m) {
+      codes.push(`<code class="thr-code-ref"><a href="#" class="thr-link" data-path="${esc(m[1])}"` + (m[2] ? ` data-line="${m[2]}"` : '') + `>${esc(trimmed)}</a></code>`);
+    } else {
+      codes.push('<code>' + esc(trimmed) + '</code>');
+    }
     return '%%PXCODE' + (codes.length - 1) + '%%';
   });
 
@@ -88,20 +99,25 @@ function thrInline(src) {
   };
 
   // Images: ![alt](url)
-  s = s.replace(/!\[([^\]]*)\]\(((?:[^()]+|\([^()]*\))*)\)/g, (_, alt, url) => {
+  s = s.replace(/!\[([^\]]*)\]\(((?:[^()]|\([^()]*\))*)\)/g, (_, alt, url) => {
     const u = thrSafeUrl(url);
     return u ? pushLink(`<img src="${u}" alt="${esc(alt)}" class="thr-img" />`) : esc(alt);
   });
 
   // Links: [text](url)
-  s = s.replace(/\[([^\]]+)\]\(((?:[^()]+|\([^()]*\))*)\)/g, (_, text, url) => {
+  s = s.replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))*)\)/g, (_, text, url) => {
     const u = thrSafeUrl(url);
     if (!u) return text;
-    const m = /^([a-zA-Z0-9_.\-/]+\.[a-zA-Z0-9]+)(?::(\d+))?$/.exec(url.trim());
+    const m = /^([a-zA-Z0-9_.\-/]+\.[a-zA-Z0-9]+)(?::(\d+)(?:-\d+)?)?$/.exec(url.trim());
     if (m && !url.includes('://')) {
       return pushLink(`<a href="#" class="thr-link" data-path="${esc(m[1])}"` + (m[2] ? ` data-line="${m[2]}"` : '') + `>${text}</a>`);
     }
     return pushLink(`<a href="${u}" target="_blank" rel="noopener noreferrer">${text}</a>`);
+  });
+
+  // Bare file:line in prose: e.g. "at agent.go:120"
+  s = s.replace(/(^|[\s(])([a-zA-Z0-9_.\-/]+\.[a-zA-Z0-9]+):(\d+)(?:-(\d+))?(?=[\s),.;:!?]|$)/g, (_, prefix, path, line) => {
+    return prefix + pushLink(`<a href="#" class="thr-link" data-path="${esc(path)}" data-line="${line}">${esc(path)}:${line}</a>`);
   });
 
   // 4. Bracketed autolinks: <https://...>
@@ -129,7 +145,7 @@ function thrInline(src) {
   return s;
 }
 
-function thrMd(src) {
+export function thrMd(src) {
   if (!src) return '';
   const lines = src.replace(/\r\n?/g, '\n').split('\n');
   let html = '';
@@ -155,7 +171,7 @@ function thrMd(src) {
         i++;
       }
       const code = esc(codeLines.join('\n'));
-      html += `<div class="thr-pre"` + (lang ? ` data-lang="${esc(lang)}"` : '') + `><pre><code>` + code + `</code></pre><button class="thr-copy" title="Copy code" aria-label="Copy code"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5V3a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg></button></div>`;
+      html += `<div class="thr-pre"` + (lang ? ` data-lang="${esc(lang)}"` : '') + `><pre><code>` + code + `</code></pre><button class="thr-copy" title="Copy code" aria-label="Copy code">` + COPY_ICON + `</button></div>`;
       continue;
     }
 
@@ -351,6 +367,31 @@ function thrMd(src) {
 
 /* ---------- list view ---------- */
 
+export function showThreadsSidebar() {
+  hideRightInspector();
+  document.body.classList.remove('threads-hidden');
+  $('#btn-top-threads')?.classList.add('active');
+  if (!thr.cur && !thr.draft) thrShow('list');
+  thrDrawList();
+  layout();
+  render();
+}
+
+export function hideThreadsSidebar() {
+  document.body.classList.add('threads-hidden');
+  $('#btn-top-threads')?.classList.remove('active');
+  layout();
+  render();
+}
+
+export function toggleThreadsSidebar() {
+  if (document.body.classList.contains('threads-hidden')) {
+    showThreadsSidebar();
+  } else {
+    hideThreadsSidebar();
+  }
+}
+
 const thrEl = {};
 
 function thrShow(view) {
@@ -366,8 +407,10 @@ function thrVisible() {
 function thrDrawList() {
   if (!thrEl.list) return;
   const items = thrVisible();
-  const dot = $('#tab-threads .thr-tab-dot');
-  if (dot) dot.hidden = !thr.list.some(t => t.running);
+  const running = thr.list.some(t => t.running);
+  $$('.thr-tab-dot').forEach(dot => {
+    dot.hidden = !running;
+  });
   if (!items.length) {
     thrEl.list.innerHTML = '<div class="hint">' + (thr.filter === 'file'
       ? 'No threads started in this file. Select code and press <b data-keys="Alt+T"></b> to start one.'
@@ -378,7 +421,9 @@ function thrDrawList() {
   thrEl.list.innerHTML = items.map(t =>
     '<div class="thr-item' + (thr.cur && thr.cur.id === t.id ? ' sel' : '') + '" data-id="' + esc(t.id) + '" role="button" tabindex="0">' +
     '<div class="thr-item-title">' + (t.running ? '<span class="thr-spin" title="Working"></span>' : t.failed ? '<span class="thr-fail" title="Last reply failed">!</span>' : '') +
-    '<span>' + esc(t.title) + '</span>' + (t.kind ? '<span class="thr-kind">' + (t.kind === 'batch' ? 'batch' : 'inline') + '</span>' : '') + '</div>' +
+    '<span class="thr-item-title-text">' + esc(t.title) + '</span>' + (t.kind ? '<span class="thr-kind">' + (t.kind === 'batch' ? 'batch' : 'inline') + '</span>' : '') +
+    '<button class="thr-item-del mini" data-del="' + esc(t.id) + '" title="Delete this thread" aria-label="Delete thread"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg></button>' +
+    '</div>' +
     '<div class="thr-item-meta"><span class="thr-item-ref">' + esc(thrRefText(t)) + '</span>' +
     '<span>' + t.turns + (t.turns === 1 ? ' turn' : ' turns') + ' · ' + thrAgo(t.updated) + '</span></div></div>').join('');
 }
@@ -392,26 +437,25 @@ function thrApplyList(next) {
 }
 
 function thrConnectList() {
-  if (thr.listEs) return;
-  const es = thr.listEs = new EventSource(thrUrl('api/threads/stream'));
-  es.addEventListener('list', e => thrApplyList(JSON.parse(e.data)));
-  es.addEventListener('summary', e => {
-    const s = JSON.parse(e.data);
-    const next = thr.list.filter(t => t.id !== s.id);
-    next.push(s);
+  onStream('threads:list', thrApplyList);
+  onStream('threads:summary', sm => {
+    const next = thr.list.filter(t => t.id !== sm.id);
+    next.push(sm);
     next.sort((a, b) => b.updated - a.updated);
     thrApplyList(next);
   });
-  es.addEventListener('deleted', e => {
-    const { id } = JSON.parse(e.data);
+  onStream('threads:deleted', ({ id }) => {
     thrApplyList(thr.list.filter(t => t.id !== id));
   });
+  setStreamTopic('threads', true);
 }
 
 /* ---------- thread view ---------- */
 
 function thrCloseStream() {
-  if (thr.threadEs) { thr.threadEs.close(); thr.threadEs = null; }
+  thr.releaseThread?.();
+  thr.releaseThread = null;
+  thr.threadId = null;
 }
 
 const thrRunning = () => !!(thr.cur && thr.cur.turns.length && thr.cur.turns[thr.cur.turns.length - 1].running);
@@ -447,8 +491,13 @@ function thrTurnHtml(turn) {
   if (turn.error) h += '<div class="thr-err">' + esc(turn.error) + '</div>';
   if (!turn.running) {
     if (turn.changed && turn.changed.length) {
-      h += '<div class="thr-changed"><span class="thr-changed-label">Changed ' + turn.changed.length + (turn.changed.length === 1 ? ' file' : ' files') + '</span>' +
-        turn.changed.map(p => '<button class="thr-file" data-path="' + esc(p) + '" title="Open ' + esc(p) + '">' + esc(p) + '</button>').join('') + '</div>';
+      const revertHtml = turn.beforeSha
+        ? (turn.reverted
+          ? '<span class="thr-reverted-badge">Reverted</span>'
+          : '<button type="button" class="thr-revert-btn" data-revert-turn="' + turn.id + '" title="Revert files modified in this turn back to pre-turn snapshot">Revert turn</button>')
+        : '';
+      h += '<div class="thr-changed"><div class="thr-changed-head"><span class="thr-changed-label">Changed ' + turn.changed.length + (turn.changed.length === 1 ? ' file' : ' files') + '</span>' + revertHtml + '</div>' +
+        turn.changed.map(p => '<button class="thr-file" data-path="' + esc(p) + '" data-turn-id="' + turn.id + '" title="Review changes in ' + esc(p) + '">' + esc(p) + '</button>').join('') + '</div>';
     } else if (turn.tracked === false) {
       h += '<div class="thr-changed"><span class="thr-changed-label">Changes unknown outside a git repository; the workspace was reloaded.</span></div>';
     }
@@ -467,6 +516,43 @@ function thrRenderMsgs() {
   if (stick) box.scrollTop = box.scrollHeight;
 }
 
+/* PR review: what the thread is about. The default comes from where you are --
+   the editor section a selection was made in, then the sidebar's Yours / PR
+   changes switch, else the whole PR -- and the chips override it. */
+function thrDefaultScope(info) {
+  const sel = getSelection();
+  const sec = (sel && sel.anchorNode ? (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement) : null)?.closest?.('.diff-section');
+  if (sec?.classList.contains('diff-section-you')) return 'mine';
+  if (sec?.classList.contains('diff-section-pr')) return 'pr';
+  return $('#tree')?.classList.contains('scope-yours') ? 'mine' : 'pr';
+}
+
+function thrRenderScope() {
+  const el = $('#thr-scope');
+  if (!el) return;
+  const t = thr.cur || thr.draft;
+  el.hidden = !S.meta?.pr || !t;
+  if (el.hidden) return;
+  const scope = t.scope || 'pr';
+  const anchored = !!t.path;
+  for (const b of el.querySelectorAll('button[data-scope]')) {
+    const on_ = b.dataset.scope === scope;
+    b.classList.toggle('active', on_);
+    b.setAttribute('aria-pressed', on_ ? 'true' : 'false');
+    if (b.dataset.scope === 'selection') b.disabled = !anchored;
+  }
+}
+
+async function thrPickScope(scope) {
+  if (thr.cur) {
+    try { thr.cur = await apiPostJson('/api/threads/scope', { id: thr.cur.id, scope }); }
+    catch (e) { showToast('!', e.message); return; }
+  } else if (thr.draft) {
+    thr.draft.scope = scope;
+  }
+  thrRenderScope();
+}
+
 function thrRenderState() {
   const running = thrRunning();
   thrEl.title.textContent = thr.cur ? thr.cur.title : 'New thread';
@@ -475,34 +561,52 @@ function thrRenderState() {
   thrEl.send.disabled = running || thr.sending;
   thrEl.hint.textContent = running ? 'Working. You can send the next message once it replies.' : 'Enter to send, Shift+Enter for a new line';
   thrRenderAnchor();
+  thrRenderScope();
   thrRenderMsgs();
   thrDrawList();
 }
 
 function thrOpenStream(id) {
   thrCloseStream();
-  const es = thr.threadEs = new EventSource(thrUrl('api/threads/stream?id=' + encodeURIComponent(id)));
-  es.addEventListener('thread', e => {
-    if (thr.threadEs !== es) return;
-    thr.cur = JSON.parse(e.data);
+  thr.threadId = id;
+  thr.releaseThread = watchThread(id);
+}
+
+// Live events for the open thread arrive as {id, data}; anything for a thread
+// we have since left is dropped.
+function thrWireStream() {
+  const mine = d => thr.threadId === d.id;
+  onStream('thread:thread', d => {
+    if (!mine(d)) return;
+    thr.cur = d.data;
     thrRenderState();
   });
-  es.addEventListener('delta', e => {
-    if (thr.threadEs !== es || !thr.cur) return;
-    const d = JSON.parse(e.data);
+  let deltaRAF = 0;
+  const dirtyTurns = new Set();
+  onStream('thread:delta', ({ id, data: d }) => {
+    if (thr.threadId !== id || !thr.cur) return;
     const turn = thr.cur.turns.find(x => x.id === d.turn);
     if (!turn) return;
     turn.reply = (turn.reply || '') + d.text;
-    const body = thrEl.msgs.querySelector('.thr-agent[data-turn="' + d.turn + '"] .thr-reply');
-    if (!body) return;
-    const box = thrEl.msgs;
-    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
-    body.innerHTML = thrMd(turn.reply);
-    if (stick) box.scrollTop = box.scrollHeight;
+    dirtyTurns.add(d.turn);
+    if (deltaRAF) return;
+    deltaRAF = requestAnimationFrame(() => {
+      deltaRAF = 0;
+      if (!thr.threadId || !thr.cur) { dirtyTurns.clear(); return; }
+      const box = thrEl.msgs;
+      const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+      for (const turnId of dirtyTurns) {
+        const t = thr.cur.turns.find(x => x.id === turnId);
+        if (!t) continue;
+        const body = box.querySelector('.thr-agent[data-turn="' + turnId + '"] .thr-reply');
+        if (body) body.innerHTML = thrMd(t.reply);
+      }
+      dirtyTurns.clear();
+      if (stick) box.scrollTop = box.scrollHeight;
+    });
   });
-  es.addEventListener('tool', e => {
-    if (thr.threadEs !== es || !thr.cur) return;
-    const d = JSON.parse(e.data);
+  onStream('thread:tool', ({ id, data: d }) => {
+    if (thr.threadId !== id || !thr.cur) return;
     const turn = thr.cur.turns.find(x => x.id === d.turn);
     if (!turn) return;
     (turn.tools = turn.tools || []).push(d.text);
@@ -517,22 +621,35 @@ function thrOpenStream(id) {
     }
     if (stick) box.scrollTop = box.scrollHeight;
   });
-  es.addEventListener('deleted', () => { if (thr.threadEs === es) thrBack(); });
-  es.onerror = () => { /* EventSource reconnects on its own and resends a snapshot */ };
+  onStream('thread:deleted', d => { if (mine(d)) thrBack(); });
 }
 
-export function openThread(id) {
+export async function openThread(id) {
   thr.draft = null;
   thr.cur = null;
-  showRightInspector('threads');
+  thrCloseStream();
+  showThreadsSidebar();
   thrShow('thread');
   thrEl.msgs.innerHTML = '<div class="hint">Loading…</div>';
   thrEl.title.textContent = 'Thread';
   thrEl.del.hidden = true;
-  thrOpenStream(id);
+  thr.opening = id;
+  // A plain request shows a saved thread at once. The live stream is only for
+  // a turn still being written, so browsing past threads never waits on it.
+  try {
+    const t = await api('/api/threads/get', { id });
+    if (thr.opening !== id) return;
+    thr.cur = t;
+    thrRenderState();
+    if (thrRunning()) thrOpenStream(id);
+  } catch (e) {
+    if (thr.opening !== id) return;
+    thrEl.msgs.innerHTML = '<div class="hint">Could not load this thread: ' + esc(e.message) + '</div>';
+  }
 }
 
 function thrBack() {
+  thr.opening = null;
   thrCloseStream();
   thr.cur = null;
   thr.draft = null;
@@ -544,10 +661,12 @@ function thrBack() {
    omitted. Nothing is created on the server until the first message is sent. */
 export function newThread(info) {
   if (!thr.avail) { showToast('!', 'Threads need a coding harness: run px0 without -no-agent'); return; }
+  thr.opening = null;
   thrCloseStream();
   thr.cur = null;
   thr.draft = info && info.path ? { path: info.path, l1: info.l1, l2: info.l2 } : {};
-  showRightInspector('threads');
+  if (S.meta?.pr) thr.draft.scope = thrDefaultScope(info);
+  showThreadsSidebar();
   thrShow('thread');
   thrRenderState();
   if (info) hideSelectionBar();
@@ -567,6 +686,7 @@ async function thrSend() {
       thrOpenStream(t.id);
     } else if (thr.cur) {
       await apiPostJson('/api/threads/send', { id: thr.cur.id, message });
+      if (thr.threadId !== thr.cur.id) thrOpenStream(thr.cur.id);
     } else {
       return;
     }
@@ -577,6 +697,24 @@ async function thrSend() {
     thr.sending = false;
     thrRenderState();
   }
+}
+
+export async function deleteThread(id) {
+  if (!id) return;
+  const t = thr.list.find(x => x.id === id) || (thr.cur?.id === id ? thr.cur : null);
+  const title = t?.title ? `"${t.title}"` : 'this thread';
+  if (!confirm(`Delete ${title} and its transcript?`)) return;
+  try {
+    await apiPost('/api/threads/delete', { id });
+    if (thr.cur && thr.cur.id === id) thrBack();
+  } catch (e) {
+    showToast('!', e.message);
+  }
+}
+
+export function deleteCurrentThread() {
+  if (thr.cur) deleteThread(thr.cur.id);
+  else showToast('!', 'No thread currently open');
 }
 
 export function initThreads() {
@@ -591,6 +729,10 @@ export function initThreads() {
   thrEl.send = $('#thr-send');
   thrEl.stop = $('#thr-stop');
   thrEl.hint = $('#thr-hint');
+  $('#thr-scope')?.addEventListener('click', e => {
+    const b = e.target.closest('button[data-scope]');
+    if (b && !b.disabled) thrPickScope(b.dataset.scope);
+  });
   if (!thrEl.listView) return;
 
   setThreadHandler(newThread);
@@ -598,16 +740,28 @@ export function initThreads() {
 
   $('#thr-new').addEventListener('click', () => newThread(null));
   $('#thr-back').addEventListener('click', thrBack);
+  $('#btn-top-threads')?.addEventListener('click', toggleThreadsSidebar);
+  $('#btn-close-threads')?.addEventListener('click', hideThreadsSidebar);
+
+  /* Threads sidebar resizer */
+  (() => {
+    const trz = $('#threads-resizer');
+    if (!trz) return;
+    let dragging = false;
+    trz.addEventListener('mousedown', e => { dragging = true; trz.classList.add('drag'); e.preventDefault(); });
+    addEventListener('mousemove', e => {
+      if (!dragging) return;
+      const w = Math.max(260, Math.min(800, window.innerWidth - e.clientX));
+      $('#threads-side').style.width = w + 'px';
+    });
+    addEventListener('mouseup', () => { if (dragging) { dragging = false; trz.classList.remove('drag'); layout(); render(); } });
+  })();
   thrEl.send.addEventListener('click', thrSend);
   thrEl.stop.addEventListener('click', () => {
     if (thr.cur) apiPost('/api/threads/cancel', { id: thr.cur.id }).catch(e => showToast('!', e.message));
   });
-  thrEl.del.addEventListener('click', async () => {
-    if (!thr.cur || !confirm('Delete this thread and its transcript?')) return;
-    try {
-      await apiPost('/api/threads/delete', { id: thr.cur.id });
-      thrBack();
-    } catch (e) { showToast('!', e.message); }
+  thrEl.del.addEventListener('click', () => {
+    if (thr.cur) deleteThread(thr.cur.id);
   });
   thrEl.input.addEventListener('keydown', e => {
     // Typing here must not trigger editor shortcuts, or Esc closing the sidebar.
@@ -623,7 +777,17 @@ export function initThreads() {
     const cp = /** @type {HTMLElement|null} */ (e.target)?.closest('.thr-copy');
     if (cp) {
       const code = cp.closest('.thr-pre')?.querySelector('code')?.textContent || '';
-      if (code) copyToClipboard(code, 'Copied code', cp);
+      if (code) {
+        // The button is icon-sized: a tick, not the "✓ Copied" label flash.
+        copyToClipboard(code, 'Copied code');
+        clearTimeout(cp._copiedTimer);
+        cp.classList.add('copied');
+        cp.innerHTML = COPIED_ICON;
+        cp._copiedTimer = setTimeout(() => {
+          cp.classList.remove('copied');
+          cp.innerHTML = COPY_ICON;
+        }, 1400);
+      }
       return;
     }
     const link = /** @type {HTMLElement|null} */ (e.target)?.closest('a.thr-link');
@@ -632,15 +796,63 @@ export function initThreads() {
       openFile(link.dataset.path, { line: +link.dataset.line || 1 });
       return;
     }
+    const rev = /** @type {HTMLElement|null} */ (e.target)?.closest('[data-revert-turn]');
+    if (rev && thr.cur) {
+      const turnId = +rev.dataset.revertTurn;
+      rev.disabled = true;
+      apiPostJson('/api/threads/revert', { id: thr.cur.id, turn: turnId })
+        .then(updated => {
+          thr.cur = updated;
+          thrRenderState();
+          reloadWorkspace(null, 'Reverted turn #' + turnId);
+          showToast('Reverted turn #' + turnId, 'success', 2500);
+        })
+        .catch(err => {
+          rev.disabled = false;
+          showToast('!', 'Revert failed: ' + err.message);
+        });
+      return;
+    }
     const f = /** @type {HTMLElement|null} */ (e.target)?.closest('.thr-file');
-    if (f) openFile(f.dataset.path);
+    if (f) {
+      const turnId = +f.dataset.turnId;
+      const turn = thr.cur?.turns?.find(x => x.id === turnId);
+      if (turn && turn.beforeSha && turn.afterSha && !turn.reverted) {
+        openFile(f.dataset.path, {
+          ref: turn.afterSha,
+          base: turn.beforeSha,
+          turnFiles: turn.changed,
+          turnLabel: 'Turn #' + turn.id,
+          view: 'diff',
+        });
+      } else {
+        openFile(f.dataset.path);
+      }
+    }
   });
   const openFromList = e => {
+    const delBtn = /** @type {HTMLElement|null} */ (e.target)?.closest('[data-del]');
+    if (delBtn) {
+      e.stopPropagation();
+      e.preventDefault();
+      deleteThread(delBtn.dataset.del);
+      return;
+    }
     const item = /** @type {HTMLElement|null} */ (e.target)?.closest('.thr-item');
     if (item) openThread(item.dataset.id);
   };
   thrEl.list.addEventListener('click', openFromList);
-  thrEl.list.addEventListener('keydown', e => { if (e.key === 'Enter') openFromList(e); });
+  thrEl.list.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      openFromList(e);
+    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      const item = /** @type {HTMLElement|null} */ (e.target)?.closest('.thr-item');
+      if (item && item.dataset.id) {
+        e.preventDefault();
+        deleteThread(item.dataset.id);
+      }
+    }
+  });
   $$('[data-thr-filter]').forEach(b => b.addEventListener('click', () => {
     thr.filter = b.dataset.thrFilter;
     $$('[data-thr-filter]').forEach(x => x.classList.toggle('on', x === b));
@@ -648,25 +860,27 @@ export function initThreads() {
   }));
   on('tab:activated', () => { if (thr.filter === 'file') thrDrawList(); });
   // agent.js keeps its inline edit comments at the top of this pane and hands off here.
-  on('threads:reveal', () => showRightInspector('threads'));
+  on('threads:reveal', () => showThreadsSidebar());
   on('threads:open', id => { if (id) openThread(id); });
   on('threads:drafts', n => {
-    const c = $('#tab-threads .thr-tab-count');
-    if (!c) return;
-    c.hidden = !n;
-    c.textContent = n;
-    c.title = n + (n === 1 ? ' comment' : ' comments') + ' waiting to be applied';
+    $$('.thr-tab-count').forEach(c => {
+      c.hidden = !n;
+      c.textContent = n;
+      c.title = n + (n === 1 ? ' comment' : ' comments') + ' waiting to be applied';
+    });
   });
   on('threads:shown', () => { if (!thr.cur && !thr.draft) thrShow('list'); thrDrawList(); });
 
   // Threads exist whenever a harness manager does; -no-agent removes them.
   api('/api/threads').then(j => {
     thr.avail = true;
-    $('#tab-threads').hidden = false;
+    $('#btn-top-threads')?.removeAttribute('hidden');
     thr.list = j.threads || [];
     thrDrawList();
+    thrWireStream();
     thrConnectList();
   }).catch(() => {
+    $('#btn-top-threads')?.setAttribute('hidden', '');
     $('[data-sel="thread"]')?.setAttribute('hidden', '');
   });
 }

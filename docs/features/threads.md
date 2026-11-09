@@ -23,7 +23,7 @@ Type in the compose box and press `Enter` to send (`Shift+Enter` for a new line)
 
 - **Steps**: a collapsible list of what the harness did, such as `Read calc.go` or `Edit server.go`. It is open while the turn runs.
 - **Reply**: the harness's written answer, with code blocks, inline code, bold and bullet lists rendered.
-- **Changed files**: after each turn, a chip for every file that turn touched. Click one to open it. Open tabs reload in place when a turn that changed files finishes.
+- **Changed files & Turn Review**: before and after each turn in a Git repository, px0 captures an isolated worktree snapshot commit (`beforeSha` / `afterSha`) in `.git/objects` without touching `HEAD` or `.git/index`. Clicking any changed file chip opens the exact diff introduced by that turn, with a review strip to step through all files touched in that turn (`[f` / `]f`) and **Revert turn** to restore every file touched by that turn back to its pre-turn state. Open tabs reload in place when a turn that changed files finishes.
 
 Each message continues the same conversation, so "and what about the tests?" works. While a reply is being written you can press **Stop**; whatever the harness already wrote to disk stays.
 
@@ -35,11 +35,21 @@ There is no overlap guard. Threads and inline edits can run at the same time, on
 
 [Inline edit](agent-editing.md) comment boxes live at the top of this same pane (the tab shows how many are waiting to be applied), so composing, applying and following up all happen in one place. An inline edit or batch you apply is recorded as a thread, labelled `inline` or `batch` in the list. Open it to read the agent's summary and the files it changed, or send a follow-up such as "also update the tests". These threads keep the overlap check inline edits have always had: an edit on lines another edit is still changing is refused. A conversation you start yourself is never blocked this way.
 
+## Threads in a PR Review
+
+In a [PR review](github-pr-review.md) a thread has a scope, picked with the **About** chips above the message box:
+
+- **Whole PR**: the entire pull request, merge-base to PR head. This is what "the PR" means, not the latest commit.
+- **My changes**: only what you have done on top of the PR, uncommitted and unpushed.
+- **Selection**: just the code the thread is anchored to.
+
+The default comes from where you started: the editor section a selection was made in (PR changes or Your changes), then the sidebar's **PR changes / Yours** switch, otherwise the whole PR. You can change it at any time; the assistant is told on the next message. The assistant is given the exact git range for the scope and the diff saved as a file, so it reads the whole change instead of guessing.
+
 ## The Thread List
 
 The list shows every thread for the workspace, most recently active first, with its anchor, turn count and age. A spinner marks a thread that is working, and `!` marks one whose last reply failed. **This file** filters to threads started in the open file. The **Threads** tab shows a pulsing dot while any thread is working, so you can leave it and come back.
 
-Threads are stored on disk and survive restarts. A reply that was still running when px0 exited is marked as interrupted. Delete a thread with the trash button in its header.
+Threads are stored on disk and survive restarts. A reply that was still running when px0 exited is marked as interrupted. You can delete a thread using the trash button in its header, by hovering over it in the thread list and clicking its trash button (or pressing `Delete`/`Backspace` when focused), or by running **Threads: Delete Current Thread** from the command palette.
 
 ## Requirements
 

@@ -1,7 +1,7 @@
 // web/src/cursor.js
 import { $, S, doc_, MOD, LH, api } from './state.js';
 import { vp, rowsEl } from './ui.js';
-import { paint, render, rowFor, placeCaret, toPoint } from './renderer.js';
+import { paint, render, rowFor, placeCaret, toPoint, getLH, lineTopY, lineHeightAt } from './renderer.js';
 import { updateStatus } from './status.js';
 import { gotoDefinition } from './lsp.js';
 import { pushHistory } from './history.js';
@@ -26,9 +26,24 @@ export function wordAtPoint(x, y) {
   } else return null;
   if (!node || node.nodeType !== 3) return null;
 
-  const code = node.parentElement && node.parentElement.closest('.c');
-  const row = /** @type {HTMLElement|null} */ (code && code.closest('.row'));
-  if (!code || !row) return null;
+  let code = node.parentElement && node.parentElement.closest('.c');
+  let row = /** @type {HTMLElement|null} */ (code && code.closest('.row'));
+  let line = 0;
+  let inDiff = false;
+
+  if (code && row) {
+    line = +row.dataset.l;
+  } else {
+    const diffCode = node.parentElement && node.parentElement.closest('.diff-code');
+    const diffRow = diffCode && diffCode.closest('[data-l], [data-at], [data-old-l]');
+    if (diffCode && diffRow) {
+      code = diffCode;
+      inDiff = true;
+      line = diffRow.dataset.l !== undefined ? +diffRow.dataset.l :
+             (diffRow.dataset.oldL !== undefined ? +diffRow.dataset.oldL : +diffRow.dataset.at);
+    }
+  }
+  if (!code || !line) return null;
 
   let col = 0;
   const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT);
@@ -37,18 +52,17 @@ export function wordAtPoint(x, y) {
     col += n.nodeValue.length;
   }
 
-  const full = code.textContent;
+  const full = code.textContent || '';
   let a = Math.min(col, full.length), b = a;
   while (a > 0 && WORD.test(full[a - 1])) a--;
   while (b < full.length && WORD.test(full[b])) b++;
   if (a === b) return null;
   const d = doc_();
-  return { word: full.slice(a, b), line: +row.dataset.l, col: a, path: d && d.path };
+  return { word: full.slice(a, b), line, col: a, path: d && d.path, inDiff };
 }
 
-/* Returns { target, line, col, startCol, endCol, path } when the point lies
-   inside a quoted import/file path string (e.g. './state.js', "pkg/foo", `docs/guide.md`),
-   angle-bracketed include, or markdown link target. */
+/* The file reference under a point: a quoted import or path, a Markdown link
+   target or an #include. Same shape as wordAtPoint, plus `target`. */
 export function pathAtPoint(x, y) {
   let node, off;
   if (document.caretPositionFromPoint) {
@@ -76,95 +90,49 @@ export function pathAtPoint(x, y) {
   const full = code.textContent;
   if (!full || col < 0 || col > full.length) return null;
 
-  // 1. Check if inside quotes: '...', "...", `...`
-  let quoteStart = -1, quoteChar = '';
+  const hit = (start, end) => {
+    const inner = full.slice(start, end), raw = inner.trim();
+    if (!looksLikePath(raw)) return null;
+    const d = doc_();
+    return { kind: 'path', target: raw, word: raw, line: +row.dataset.l, col: start + inner.indexOf(raw), path: d && d.path };
+  };
+  const unescaped = i => {
+    let backslashes = 0;
+    for (let j = i - 1; j >= 0 && full[j] === '\\'; j--) backslashes++;
+    return backslashes % 2 === 0;
+  };
+
+  // 1. Inside quotes: '...', "...", `...`
+  let quoteStart = -1;
   for (let i = col - 1; i >= 0; i--) {
-    const ch = full[i];
-    if (ch === "'" || ch === '"' || ch === '`') {
-      let backslashes = 0;
-      for (let j = i - 1; j >= 0 && full[j] === '\\'; j--) backslashes++;
-      if (backslashes % 2 === 0) { quoteStart = i; quoteChar = ch; break; }
-    }
+    if ((full[i] === "'" || full[i] === '"' || full[i] === '`') && unescaped(i)) { quoteStart = i; break; }
   }
-
   if (quoteStart >= 0) {
-    let quoteEnd = -1;
     for (let i = col; i < full.length; i++) {
-      if (full[i] === quoteChar) {
-        let backslashes = 0;
-        for (let j = i - 1; j >= 0 && full[j] === '\\'; j--) backslashes++;
-        if (backslashes % 2 === 0) { quoteEnd = i; break; }
-      }
-    }
-    if (quoteEnd > quoteStart) {
-      const raw = full.slice(quoteStart + 1, quoteEnd).trim();
-      if (looksLikePath(raw)) {
-        const d = doc_();
-        return {
-          kind: 'path',
-          target: raw,
-          line: +row.dataset.l,
-          col: quoteStart + 1,
-          startCol: quoteStart + 1,
-          endCol: quoteEnd,
-          word: raw,
-          path: d && d.path,
-        };
+      if (full[i] === full[quoteStart] && unescaped(i)) {
+        const found = hit(quoteStart + 1, i);
+        if (found) return found;
+        break;
       }
     }
   }
 
-  // 2. Check if inside markdown link target: [text](path)
-  const parenStart = full.lastIndexOf('(', col);
-  if (parenStart >= 0) {
-    const parenEnd = full.indexOf(')', col);
-    if (parenEnd > parenStart) {
-      const raw = full.slice(parenStart + 1, parenEnd).trim();
-      if (looksLikePath(raw)) {
-        const d = doc_();
-        return {
-          kind: 'path',
-          target: raw,
-          line: +row.dataset.l,
-          col: parenStart + 1,
-          startCol: parenStart + 1,
-          endCol: parenEnd,
-          word: raw,
-          path: d && d.path,
-        };
-      }
+  // 2. Inside a Markdown link target, then 3. inside angle brackets (#include <foo.h>).
+  for (const [open, close] of [['(', ')'], ['<', '>']]) {
+    const start = full.lastIndexOf(open, col);
+    const end = start >= 0 ? full.indexOf(close, col) : -1;
+    if (end > start) {
+      const found = hit(start + 1, end);
+      if (found) return found;
     }
   }
-
-  // 3. Check if inside angle brackets: #include <foo.h>
-  const angleStart = full.lastIndexOf('<', col);
-  if (angleStart >= 0) {
-    const angleEnd = full.indexOf('>', col);
-    if (angleEnd > angleStart) {
-      const raw = full.slice(angleStart + 1, angleEnd).trim();
-      if (looksLikePath(raw)) {
-        const d = doc_();
-        return {
-          kind: 'path',
-          target: raw,
-          line: +row.dataset.l,
-          col: angleStart + 1,
-          startCol: angleStart + 1,
-          endCol: angleEnd,
-          word: raw,
-          path: d && d.path,
-        };
-      }
-    }
-  }
-
   return null;
 }
 
 function looksLikePath(s) {
   if (!s || s.length < 2 || s.length > 260) return false;
-  if (s.startsWith('http://') || s.startsWith('https://') || s.startsWith('mailto:') || s.startsWith('data:')) return false;
-  if (s.includes('/') || s.includes('\\') || s.startsWith('./') || s.startsWith('../')) return true;
+  if (/^(https?|mailto|data):/.test(s)) return false;
+  if (s.includes('/') || s.includes('\\')) return true;
   return /\.(js|ts|tsx|jsx|mjs|cjs|go|py|rs|java|c|h|cpp|hpp|cc|json|css|html|md|markdown|yaml|yml|toml|sql|sh|txt)$/i.test(s);
 }
 
@@ -318,9 +286,11 @@ export function moveCursor(delta, shift = false) {
   else d.selAnchor = null;
 
   d.cur = Math.max(1, Math.min(d.total, d.cur + delta));
-  const y = (d.cur - 1) * LH;
-  if (y < vp.scrollTop) vp.scrollTop = y - LH;
-  else if (y > vp.scrollTop + vp.clientHeight - LH * 2) vp.scrollTop = y - vp.clientHeight + LH * 3;
+  const lh = getLH();
+  const y = lineTopY(d.cur, d);
+  const h = Math.min(lineHeightAt(d.cur, d), Math.max(lh, vp.clientHeight * 0.5));
+  if (y < vp.scrollTop) vp.scrollTop = Math.max(0, y - lh);
+  else if (y + h > vp.scrollTop + vp.clientHeight - lh) vp.scrollTop = y - vp.clientHeight + h + lh * 2;
   render(); updateStatus();
   updateDomSelection();
 }
@@ -359,32 +329,28 @@ export function initCursor() {
     S.at = w;
     if (w) S.lastWord = w.word;
     if (e[MOD]) {
+      // Plain click keeps the current mode; Alt flips it.
+      const inDiff = !!d.diffMode;
+      const view = (e.altKey ? !inDiff : inDiff) ? 'diff' : 'source';
+      const toDefinition = () => {
+        if (!w) return;
+        S.at = w; S.lastWord = w.word;
+        pushHistory(d.path, d.cur); // so Alt+Left returns to the call site
+        gotoDefinition(w, { view });
+      };
       const pHit = pathAtPoint(e.clientX, e.clientY);
       if (pHit) {
         e.preventDefault();
         api('/api/resolve', { from: d.path, target: pHit.target }).then(res => {
-          if (res && res.found && res.path) {
-            pushHistory(d.path, d.cur);
-            openFile(res.path, { line: res.line || 1 });
-          } else if (w) {
-            S.at = w; S.lastWord = w.word;
-            pushHistory(d.path, d.cur);
-            gotoDefinition(w);
-          }
-        }).catch(() => {
-          if (w) {
-            S.at = w; S.lastWord = w.word;
-            pushHistory(d.path, d.cur);
-            gotoDefinition(w);
-          }
-        });
+          if (!res || !res.found || !res.path) { toDefinition(); return; }
+          pushHistory(d.path, d.cur);
+          openFile(res.path, { line: res.line || 1 });
+        }).catch(toDefinition);
         return;
       }
       if (w) {
         e.preventDefault();
-        S.at = w; S.lastWord = w.word;
-        pushHistory(d.path, d.cur); // so Alt+Left returns to the call site
-        gotoDefinition(w);
+        toDefinition();
         return;
       }
     }

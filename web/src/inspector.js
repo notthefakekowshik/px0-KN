@@ -9,9 +9,17 @@ import { loadOutline, drawOutline } from './outline.js';
 import { displayPath, cancelSearch } from './search.js';
 import { groupHits, flashFind, canAskServer, lspCall, positionNow } from './lsp.js';
 
-export function showRightInspector(tab = 'refs') {
+export function firstInspectorTab() {
+  const first = Array.from($$('.inspector-tab')).find(b => !b.hidden);
+  return first?.dataset.itab || 'refs';
+}
+
+export function showRightInspector(tab) {
+  document.body.classList.add('threads-hidden');
+  $('#btn-top-threads')?.classList.remove('active');
   document.body.classList.remove('right-hidden');
-  setRightInspectorTab(tab);
+  $('#btn-open-right')?.classList.add('active');
+  setRightInspectorTab(tab || firstInspectorTab());
   layout();
   render();
 }
@@ -19,6 +27,7 @@ export function showRightInspector(tab = 'refs') {
 export function hideRightInspector() {
   cancelSearch();
   document.body.classList.add('right-hidden');
+  $('#btn-open-right')?.classList.remove('active');
   layout();
   render();
 }
@@ -30,8 +39,11 @@ export function setRightInspectorTab(tab) {
   $('#pane-right-symbols')?.classList.toggle('active', tab === 'symbols');
   $('#pane-right-calls')?.classList.toggle('active', tab === 'calls');
   $('#pane-right-search')?.classList.toggle('active', tab === 'search');
-  $('#pane-right-threads')?.classList.toggle('active', tab === 'threads');
-  if (tab === 'threads') emit('threads:shown');
+  $('#pane-right-tips')?.classList.toggle('active', tab === 'tips');
+  if (tab === 'tips') {
+    emit('tips:shown');
+    $('#tips-filter')?.focus();
+  }
   if (tab === 'symbols') {
     loadOutline();
     $('#right-symbols-filter')?.focus();
@@ -130,7 +142,13 @@ export function initInspector() {
   }));
 
   $('#btn-close-right')?.addEventListener('click', hideRightInspector);
-  $('#btn-open-right')?.addEventListener('click', () => showRightInspector($('#tab-threads')?.hidden === false ? 'threads' : 'refs'));
+  $('#btn-open-right')?.addEventListener('click', () => {
+    if (document.body.classList.contains('right-hidden')) {
+      showRightInspector();
+    } else {
+      hideRightInspector();
+    }
+  });
 
   /* Right inspector resizer */
   (() => {

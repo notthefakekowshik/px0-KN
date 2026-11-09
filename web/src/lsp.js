@@ -1,10 +1,11 @@
 // web/src/lsp.js
-import { $, S, doc_, api } from './state.js';
+import { S, doc_, api } from './state.js';
 import { paint } from './renderer.js';
 import { updateStatus, setStatusNote, setLspState } from './status.js';
 import { openFile } from './tabs.js';
-import { renderResults, runSearch } from './search.js';
+import { renderResults } from './search.js';
 import { inspectReferences, showRightInspector } from './inspector.js';
+import { centerEditLine, editTextarea } from './editview.js';
 
 /* Language servers answer precisely but can take a long time to wake up, while
    the regex index answers in milliseconds and is always there. So: use the
@@ -54,31 +55,26 @@ export async function lspCall(kind, at, waitMs) {
   } catch { return null; }
 }
 
-export async function gotoDefinition(arg) {
+export async function gotoDefinition(arg, opts = {}) {
   const d = doc_();
   const at = (arg && arg.word) ? arg : positionNow(typeof arg === 'string' ? arg : S.lastWord);
   if (!d || !at) return;
+  // No explicit view: follow the mode we are navigating from (diff stays diff,
+  // source stays source). A diff request on a file without a diff falls back quietly.
+  const explicit = opts.view || (arg && arg.view);
+  const view = explicit || (d.diffMode ? 'diff' : 'source');
+  const soft = !explicit;
 
   if (canAskServer(at)) {
     setStatusNote('definition of ' + at.word + '…', 8000);
     const j = await lspCall('def', at, S.lsp.state === 'ready' ? 5000 : 20000);
     updateStatus();
-    if (j && j.hits && j.hits.length) {
-      const repoHits = j.hits.filter(h => !h.ext);
-      if (repoHits.length > 0) {
-        acceptHits(at.word, repoHits, j.server, 'definition');
-        return;
-      }
-      setStatusNote('External / standard library symbol: "' + at.word + '"' + (j.server ? ' (' + j.server + ')' : ''));
-      return;
-    }
+    if (j && j.hits && j.hits.length) { acceptHits(at.word, j.hits, j.server, 'definition', undefined, { view, soft }); return; }
   } else if (!at.imprecise && S.lsp.state === 'starting') {
     // Kick the server awake for next time, but do not wait on it.
     lspCall('def', at, 60000).then(j => {
-      if (j && j.hits && j.hits.length) {
-        const repoHits = j.hits.filter(h => !h.ext);
-        if (repoHits.length > 0) showHits(at.word, repoHits, j.server, 'definition');
-      }
+      const repoHits = j && j.hits ? j.hits.filter(h => !h.ext) : [];
+      if (repoHits.length) showHits(at.word, repoHits, j.server, 'definition');
     });
   }
 
@@ -93,7 +89,7 @@ export async function gotoDefinition(arg) {
     setStatusNote('No definition found for "' + at.word + '" in repository');
     return;
   }
-  acceptHits(at.word, rx.defs, null, 'definition', rx.refCount);
+  acceptHits(at.word, rx.defs, null, 'definition', rx.refCount, { view, soft });
 }
 
 export async function findReferences(arg) {
@@ -103,21 +99,22 @@ export async function findReferences(arg) {
   inspectReferences(at);
 }
 
-export function acceptHits(word, hits, server, noun, refCount) {
-  const repoHits = hits.filter(h => !h.ext);
-  if (!repoHits.length) {
+export function acceptHits(word, allHits, server, noun, refCount, opts = {}) {
+  // Navigation stays inside the repository.
+  const hits = allHits.filter(h => !h.ext);
+  if (!hits.length) {
     setStatusNote('External / standard library symbol: "' + word + '"' + (server ? ' (' + server + ')' : ''));
     return;
   }
-  if (repoHits.length === 1) {
-    const h = repoHits[0];
-    openFile(h.path, { line: h.line });
+  if (hits.length === 1) {
+    const h = hits[0];
+    openFile(h.path, { line: h.line, view: opts.view, soft: opts.soft });
     flashFind(h.mid || word);
     setStatusNote(server ? server + ' · ' + h.path + ':' + h.line : h.path + ':' + h.line, 4000);
     return;
   }
   setStatusNote('');
-  showHits(word, repoHits, server, noun, refCount);
+  showHits(word, hits, server, noun, refCount);
 }
 
 export function showHits(word, hits, server, noun, refCount) {
@@ -142,6 +139,10 @@ export function groupHits(hits) {
 export function flashFind(q) {
   const d = doc_();
   if (!d || !q) return;
-  S.find = { q, ci: true, hits: [{ line: d.cur, n: 0 }], byLine: new Set([d.cur]), active: 0 };
+  if (d.isEditing && editTextarea) {
+    centerEditLine(d.cur, q);
+    return;
+  }
+  S.find = { q, cs: false, hits: [{ line: d.cur, n: 0 }], byLine: new Set([d.cur]), active: 0 };
   setTimeout(paint, 0);
 }
